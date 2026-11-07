@@ -88,7 +88,7 @@ local DEFAULTS = {
 	units = "km/h", speedMult = 1, grip = 1, maxVehicles = 3,
 	autoEnter = true, autoLights = true, chaseCam = true, fovEffect = true,
 	smoke = true, skidMarks = true, underglow = true, showHud = true, sounds = true,
-	maxNpcs = 30, simRadius = 1000,
+	maxNpcs = 30, simRadius = 1000, npcWander = false, npcFlee = false, npcSpeed = 8,
 	adoptNpcs = true, adoptMax = 20, adoptRange = 250,
 	npcRespawn = true, volume = 0.8,
 	lowLag = false,
@@ -510,7 +510,7 @@ function Adopt.take(h)
 	Adopt.hidden[model] = true
 	local pos = root.Position
 	table.insert(npcs, {
-		model = model, humanoid = h, root = root, home = pos, real = true, adopted = true,
+		model = model, humanoid = h, root = root, home = pos, real = true, adopted = true, nextWander = 0, target = nil,
 		ragdolled = false, recoverAt = 0, hitCooldown = 0, hp = 100, dead = false,
 		alertAt = 0, lastPos = pos, lastCheck = 0,
 		motors = {}, attachments = {}, tracks = {},
@@ -960,6 +960,7 @@ local function stepNpc(npc, dt, now)
 
 	local pos = root.Position
 	local alert = false
+	local flee = nil
 
 	for _, car in ipairs(cars) do
 		local cc = car.chassis
@@ -984,16 +985,86 @@ local function stepNpc(npc, dt, now)
 
 			local toNpc = Vector3.new(pos.X - cf.Position.X, 0, pos.Z - cf.Position.Z)
 			local d = toNpc.Magnitude
-			if d < 22 + spd * 0.7 and d > 0.1 and math.abs(pos.Y - cf.Position.Y) < car.rideH + 8 then
+			local radius = 22 + spd * 0.7
+			if d < radius and d > 0.1 and math.abs(pos.Y - cf.Position.Y) < car.rideH + 8 then
 				if (spd > 4 and flatV:Dot(toNpc) > 0) or (spd > 2 and d < 10) then
 					alert = true
+					if settings.npcFlee then
+						local away = toNpc.Unit
+						local sideDir = Vector3.zero
+						if spd > 0.1 then
+							local perp = Vector3.new(-flatV.Z, 0, flatV.X).Unit
+							sideDir = perp * (perp:Dot(toNpc) >= 0 and 1 or -1)
+						end
+						local dirv = sideDir + away * 0.5
+						if dirv.Magnitude < 0.1 then dirv = away end
+						local urgency = 1 - d / radius + 0.2
+						flee = (flee or Vector3.zero) + dirv.Unit * urgency
+					end
 				end
 			end
 		end
 	end
 	if alert then alertBubble(npc, now) end
 
-	if not npc.real then setAnim(npc, "idle") end
+	if flee and flee.Magnitude > 0.05 then
+		if npc.origSpeed == nil then npc.origSpeed = hum.WalkSpeed end
+		npc.moved = true
+		hum.WalkSpeed = math.max(26, settings.npcSpeed * 2.5)
+		hum:Move(flee.Unit, false)
+		if not npc.real then setAnim(npc, "run") end
+		if now - npc.lastCheck > 0.4 then
+			if (pos - npc.lastPos).Magnitude < 0.6 then hum.Jump = true end
+			npc.lastPos, npc.lastCheck = pos, now
+		end
+		npc.target = nil
+		return true
+	end
+
+	if not settings.npcWander then
+		npc.target = nil
+		if npc.moved then
+			npc.moved = false
+			hum:Move(Vector3.zero, false)
+			if npc.origSpeed then hum.WalkSpeed = npc.origSpeed end
+		end
+		if not npc.real then setAnim(npc, "idle") end
+		return true
+	end
+
+	if now >= npc.nextWander then
+		npc.nextWander = now + math.random(3, 7)
+		if math.random() < 0.35 then
+			npc.target = nil
+		else
+			local a = math.random() * math.pi * 2
+			local r = math.random(8, 30)
+			npc.target = npc.home + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+		end
+	end
+	if npc.target then
+		local to = Vector3.new(npc.target.X - pos.X, 0, npc.target.Z - pos.Z)
+		if to.Magnitude > 3 then
+			if npc.origSpeed == nil then npc.origSpeed = hum.WalkSpeed end
+			npc.moved = true
+			hum.WalkSpeed = settings.npcSpeed
+			hum:Move(to.Unit, false)
+			if not npc.real then setAnim(npc, "walk") end
+			if now - npc.lastCheck > 0.8 then
+				if (pos - npc.lastPos).Magnitude < 0.8 then hum.Jump = true end
+				npc.lastPos, npc.lastCheck = pos, now
+			end
+		else
+			npc.target = nil
+		end
+	else
+		if npc.moved then
+			npc.moved = false
+			hum:Move(Vector3.zero, false)
+			if npc.origSpeed then hum.WalkSpeed = npc.origSpeed end
+		end
+		if not npc.real then setAnim(npc, "idle") end
+	end
 	return true
 end
 
@@ -1193,7 +1264,12 @@ local function buildImportedCar(spec)
 			while a and a ~= model do
 				local n = a.Name:lower()
 				if n:find("steer") then match = false break end
-				if n:find("wheel") or n:find("tire") or n:find("tyre") or n:find("rim") then match = true end
+				if n:find("arch") or n:find("fender") or n:find("well") or n:find("guard") or n:find("liner")
+					or n:find("flare") or n:find("housing") or n:find("caliper") or n:find("mudflap") or n:find("splash") then
+					match = false
+					break
+				end
+				if n:find("wheel") or n:find("tire") or n:find("tyre") or n:find("%f[%a]rim%f[%A]") then match = true end
 				a = a.Parent
 			end
 			local p = d.Position
@@ -1202,6 +1278,34 @@ local function buildImportedCar(spec)
 				groups[key] = groups[key] or { parts = {} }
 				table.insert(groups[key].parts, d)
 			end
+		end
+	end
+
+	for key, g in pairs(groups) do
+		local tire, tireVol, tmn, tmx = nil, -1, nil, nil
+		for _, p in ipairs(g.parts) do
+			local pmn, pmx = boundsOfParts({ p }, CFrame.new())
+			local e = pmx - pmn
+			local vol = e.X * e.Y * e.Z
+			local n = p.Name:lower()
+			if n:find("tire") or n:find("tyre") then vol *= 1000 end
+			if vol > tireVol then tire, tireVol, tmn, tmx = p, vol, pmn, pmx end
+		end
+		if not tire then
+			groups[key] = nil
+		else
+			local center, ext = (tmn + tmx) / 2, tmx - tmn
+			local diam = math.max(ext.Y, ext.Z)
+			local kept = {}
+			for _, p in ipairs(g.parts) do
+				local pmn, pmx = boundsOfParts({ p }, CFrame.new())
+				local pc, pe = (pmn + pmx) / 2, pmx - pmn
+				local off = Vector2.new(pc.Y - center.Y, pc.Z - center.Z).Magnitude
+				if p == tire or (math.max(pe.Y, pe.Z) <= diam * 1.12 and off <= diam * 0.5 and math.abs(pc.X - center.X) <= diam) then
+					kept[#kept + 1] = p
+				end
+			end
+			g.parts, g.center, g.size = kept, center, ext
 		end
 	end
 
@@ -1231,8 +1335,7 @@ local function buildImportedCar(spec)
 	local wheels, probe = {}, {}
 	local Rsum, Rn = 0, 0
 	for _, g in pairs(groups) do
-		local gmn, gmx = boundsOfParts(g.parts, CFrame.new())
-		local c, sz = (gmn + gmx) / 2, gmx - gmn
+		local c, sz = g.center, g.size
 		local hub = Instance.new("Part")
 		hub.Name = "WheelHub"
 		hub.Size = Vector3.new(0.2, 0.2, 0.2)
@@ -2624,12 +2727,15 @@ local function buildUI()
 	Np.cell(gN, function() return "Clear NPCs" end, function() return false end, clearNpcs)
 	Np.cell(gN, function() return "Spawn 10 NPCs" end, function() return false end, function() task.spawn(spawnNpcs, 10) end)
 	Np.card("Behaviour")
-	local gN2 = Np.grid(2)
+	local gN2 = Np.grid(4)
+	Np.toggle(gN2, "Wander", "npcWander")
+	Np.toggle(gN2, "Run from cars", "npcFlee")
 	Np.toggle(gN2, "Respawn dead", "npcRespawn")
 	Np.toggle(gN2, "Map NPCs", "adoptNpcs")
 	Np.stepper("Max NPCs", "maxNpcs", 5, 60, 5, plain)
 	Np.stepper("Map NPC limit", "adoptMax", 5, 60, 5, plain)
-	Np.note("NPCs only talk. Map NPCs (the ones already in the game) are ragdolled and killed for real through network ownership, so other players see the ragdoll too. NPCs from the Spawn buttons are local copies only you can see.")
+	Np.stepper("Walk speed", "npcSpeed", 4, 16, 1, plain)
+	Np.note("Wander and Run from cars are off by default, so NPCs only talk. Turn them on to make NPCs walk around and flee from cars. Map NPCs (the ones already in the game) move, ragdoll and die through network ownership; NPCs from the Spawn buttons are local copies only you can see.")
 	Np.note("More NPCs = more lag. Each NPC's logic runs 15 times a second (10 in low lag mode) instead of every frame.")
 
 	--// SETTINGS PAGE --------------------------------------------------------------
