@@ -1656,8 +1656,8 @@ local function stepCar(car, dt, now, hum)
 		or (throttle > 0.9 and car.speed > 0 and absSpd < 10 and spec.accel >= 1.4))
 
 	if grounded then
-		local vnTarget = math.clamp((car.rideH - dist) * 10, -18, 14)
-		car.vn = (car.vn or 0) + (vnTarget - (car.vn or 0)) * math.clamp(dt * 18, 0, 1)
+		local vnTarget = math.clamp((car.rideH - dist) * 10 + Workspace.Gravity * dt * 0.5, -18, 14)
+		car.vn = (car.vn or 0) + (vnTarget - (car.vn or 0)) * math.clamp(dt * 40, 0, 1)
 		chassis.AssemblyLinearVelocity = fwd * car.speed + right * lat + nrm * car.vn
 		local tilt = cf.UpVector:Cross(nrm) * 12
 		chassis.AssemblyAngularVelocity = tilt + nrm * yaw
@@ -1686,7 +1686,7 @@ local function stepCar(car, dt, now, hum)
 	local w0 = car.wheelR - car.rideH
 	for i, w in ipairs(car.wheels) do
 		local d = dists[i]
-		local ty = w0 - 0.5
+		local ty = grounded and w.y or (w0 - 0.5)
 		if d then ty = math.clamp(car.wheelR - d, w0 - 0.5, w0 + 0.7) end
 		w.y += (ty - w.y) * math.clamp(dt * 14, 0, 1)
 		local base = CFrame.new(w.x, w.y, w.z)
@@ -3198,6 +3198,28 @@ RunService:BindToRenderStep("MonkeyCamera", Enum.RenderPriority.Camera.Value + 1
 local lastChar = nil
 local hudAcc = 0
 local adoptAcc = 0
+
+local driverParts, driverPartsAt, driverPartsChar = {}, 0, nil
+track(RunService.Stepped:Connect(function()
+	local car = drivenCar
+	local d = car and car.driver
+	if not (d and d.char and d.char.Parent) then
+		driverParts, driverPartsChar = {}, nil
+		return
+	end
+	local now = os.clock()
+	if driverPartsChar ~= d.char or now - driverPartsAt > 0.5 then
+		driverPartsChar, driverPartsAt = d.char, now
+		driverParts = {}
+		for _, p in ipairs(d.char:GetDescendants()) do
+			if p:IsA("BasePart") then driverParts[#driverParts + 1] = p end
+		end
+	end
+	for i = 1, #driverParts do
+		local p = driverParts[i]
+		if p.CanCollide then p.CanCollide = false end
+	end
+end))
 
 track(RunService.Heartbeat:Connect(function(dt)
 	perf.dt = perf.dt * 0.95 + dt * 0.05
