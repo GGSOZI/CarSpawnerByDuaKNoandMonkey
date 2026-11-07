@@ -1,0 +1,3330 @@
+--[[
+	CAR SPAWNER  |  made by DuaKNo & Monkey
+	CLIENT-SIDE LocalScript - nothing here touches the server.
+
+	Install: put in StarterPlayer > StarterPlayerScripts (as a LocalScript),
+	or run it from your executor.
+
+	Everything (cars, NPCs, particles, UI) is created locally, so only YOU see it.
+
+	DRIVING
+	  W / S  or  Up / Down      throttle / brake / reverse
+	  A / D  or  Left / Right   steer   (thumbstick on mobile)
+	  Space                     handbrake (drift)
+	  Left Shift                nitro
+	  F                         exit car   (mobile: Jump or the EXIT button)
+	  E                         enter a nearby car (walk up to it)
+	  L lights | H horn | G siren / underglow | Q E signals | Z hazards
+	  V flip car upright | C toggle chase camera | hold Right Mouse = look around
+
+	M = open / close the menu
+]]
+
+--// SERVICES ------------------------------------------------------------------
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local ContextActionService = game:GetService("ContextActionService")
+local Debris = game:GetService("Debris")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+--// CONFIG --------------------------------------------------------------------
+local ENGINE_LOOP_ID = "rbxassetid://1102346316"
+local OOF_ID = "rbxasset://sounds/uuhhh.mp3"
+
+local STORE_API = "https://apis.roblox.com/toolbox-service/v1"
+local STORE_MODEL_TYPE = 10
+local STORE_PAGE_SIZE = 30
+
+local MAX_CAR_PARTS = 4000
+local NPC_STEP = 1 / 15
+local NPC_STEP_LOW = 1 / 10
+local HUD_STEP = 1 / 15
+local SAVE_FILE = "MonkeyHub_saved_cars.json"
+
+local SOUNDS = {
+	pain = { layers = { { id = OOF_ID, speed = 1.0, volume = 0.8, var = 0.4 } } },
+}
+SOUNDS.thud = SOUNDS.pain
+SOUNDS.hit = SOUNDS.pain
+--// ---------------------------------------------------------------------------
+
+if _G.__MonkeyVehicleStop then
+	pcall(_G.__MonkeyVehicleStop)
+end
+do
+	local function wipe(container)
+		if not container then return end
+		for _, name in ipairs({ "MonkeyVehicleUI", "MonkeyHubLoading", "CarSpawnerUI" }) do
+			local old = container:FindFirstChild(name)
+			if old then old:Destroy() end
+		end
+	end
+	wipe(playerGui)
+	pcall(function() wipe(typeof(gethui) == "function" and gethui() or nil) end)
+	pcall(function() wipe(game:GetService("CoreGui")) end)
+	for _, n in ipairs({ "MonkeyLocal", "CarSpawnerLocal" }) do
+		local oldWorld = Workspace:FindFirstChild(n)
+		if oldWorld then oldWorld:Destroy() end
+	end
+end
+
+local connections = {}
+local function track(conn)
+	table.insert(connections, conn)
+	return conn
+end
+
+local C = Color3.fromRGB
+local Smooth = Enum.Material.SmoothPlastic
+
+--// SETTINGS (kept across re-runs of the script) -----------------------------
+local DEFAULTS = {
+	units = "km/h", speedMult = 1, grip = 1, maxVehicles = 3,
+	autoEnter = true, autoLights = true, chaseCam = true, fovEffect = true,
+	smoke = true, skidMarks = true, underglow = true, showHud = true, sounds = true,
+	maxNpcs = 30, simRadius = 1000,
+	adoptNpcs = true, adoptMax = 20, adoptRange = 250,
+	npcRespawn = true, volume = 0.8,
+	lowLag = false,
+	theme = "Neon", panelW = 300, panelH = 430,
+	uiScale = UserInputService.TouchEnabled and 0.85 or 1,
+	carsOnly = true, searchSort = "Relevance", importLength = 24, importSpeed = 120,
+}
+local settings = {}
+do
+	local saved = type(_G.__MonkeySettings) == "table" and _G.__MonkeySettings or {}
+	for k, v in pairs(DEFAULTS) do
+		if saved[k] ~= nil then settings[k] = saved[k] else settings[k] = v end
+	end
+	if (settings.importLength or 0) < 20 then settings.importLength = DEFAULTS.importLength end
+	settings.paint = saved.paint
+	_G.__MonkeySettings = settings
+end
+
+--// WORLD --------------------------------------------------------------------
+local world = Instance.new("Folder")
+world.Name = "CarSpawnerLocal"
+world.Parent = Workspace
+local carFolder = Instance.new("Folder")
+carFolder.Name = "Vehicles"
+carFolder.Parent = world
+local npcFolder = Instance.new("Folder")
+npcFolder.Name = "NPCs"
+npcFolder.Parent = world
+local fxFolder = Instance.new("Folder")
+fxFolder.Name = "Effects"
+fxFolder.Parent = world
+
+local cars = {}
+local npcs = {}
+local function spawnedCount()
+	local n = 0
+	for _, npc in ipairs(npcs) do
+		if not npc.adopted then n += 1 end
+	end
+	return n
+end
+
+local Adopt = { known = {}, hidden = {}, saved = setmetatable({}, { __mode = "k" }) }
+local drivenCar = nil
+local touch = { nitro = false, brake = false }
+local perf = { dt = 1 / 60 }
+
+local UI = { cells = {}, refreshers = {} }
+local function notify(text)
+	if UI.notify then UI.notify(text) end
+end
+
+local function getCharacter()
+	local char = player.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if hum and root and hum.Health > 0 then
+		return char, hum, root
+	end
+	return nil
+end
+local playerRoot = nil
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+local groundParams = RaycastParams.new()
+groundParams.FilterType = Enum.RaycastFilterType.Exclude
+groundParams.IgnoreWater = true
+
+local function groundBelow(origin, ignoreList)
+	groundParams.FilterDescendantsInstances = ignoreList
+	return Workspace:Raycast(origin, Vector3.new(0, -300, 0), groundParams)
+end
+
+local function playSound(def, parent, volumeMul)
+	if not settings.sounds or not def then return end
+	local vol = (volumeMul or 1) * (settings.volume or 1)
+	if vol <= 0 then return end
+	local target = parent or fxFolder
+	for _, layer in ipairs(def.layers) do
+		local function fire()
+			pcall(function()
+				local s = Instance.new("Sound")
+				s.SoundId = layer.id
+				s.Volume = (layer.volume or 1) * vol
+				s.PlaybackSpeed = (layer.speed or 1) * (1 + (math.random() - 0.5) * 2 * (layer.var or 0.06))
+				s.RollOffMode = Enum.RollOffMode.InverseTapered
+				s.RollOffMinDistance = 14
+				s.RollOffMaxDistance = layer.range or 280
+				for _, e in ipairs(layer.fx or {}) do
+					local inst = Instance.new(e[1])
+					for k, v in pairs(e[2]) do inst[k] = v end
+					inst.Parent = s
+				end
+				s.Parent = target
+				s:Play()
+				Debris:AddItem(s, def.life or 4)
+			end)
+		end
+		if layer.delay then task.delay(layer.delay, fire) else fire() end
+	end
+end
+
+local function make(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	if parent then o.Parent = parent end
+	return o
+end
+
+--// NETWORK OWNERSHIP + SIMULATION RADIUS -----------------------------------------
+-- Raising your SimulationRadius makes the server hand you network ownership of the parts around
+-- you. Once you own a map NPC, what your client does to it (health, position) is what everyone sees,
+-- which is how a lethal car hit really kills the NPC. Needs an executor with sethiddenproperty;
+-- isnetworkowner is used to confirm ownership when it exists.
+local Net = { original = {} }
+
+function Net.isOwner(part)
+	if typeof(isnetworkowner) ~= "function" then return true end
+	local ok, owned = pcall(isnetworkowner, part)
+	return ok and owned == true
+end
+
+function Net.apply()
+	if not drivenCar then return end
+	local r = settings.simRadius
+	if typeof(sethiddenproperty) == "function" then
+		pcall(sethiddenproperty, player, "SimulationRadius", r)
+		pcall(sethiddenproperty, player, "MaximumSimulationRadius", r)
+	end
+	pcall(function() player.MaximumSimulationRadius = r end)
+end
+
+function Net.restore()
+	pcall(function()
+		if Net.original.maxProp then player.MaximumSimulationRadius = Net.original.maxProp end
+	end)
+	if typeof(sethiddenproperty) ~= "function" then return end
+	if Net.original.sim then pcall(sethiddenproperty, player, "SimulationRadius", Net.original.sim) end
+	if Net.original.max then pcall(sethiddenproperty, player, "MaximumSimulationRadius", Net.original.max) end
+end
+
+do
+	local okp, mp = pcall(function() return player.MaximumSimulationRadius end)
+	if okp and type(mp) == "number" then Net.original.maxProp = mp end
+end
+
+if typeof(gethiddenproperty) == "function" then
+	local ok1, sr = pcall(gethiddenproperty, player, "SimulationRadius")
+	local ok2, mr = pcall(gethiddenproperty, player, "MaximumSimulationRadius")
+	if ok1 and type(sr) == "number" then Net.original.sim = sr end
+	if ok2 and type(mr) == "number" then Net.original.max = mr end
+end
+
+function Net.claim(root, timeout)
+	Net.apply()
+	if typeof(isnetworkowner) ~= "function" then return true end
+	local t = os.clock()
+	while os.clock() - t < (timeout or 1.5) do
+		if Net.isOwner(root) then return true end
+		Net.apply()
+		RunService.Heartbeat:Wait()
+	end
+	return Net.isOwner(root)
+end
+
+function Net.kill(npc)
+	task.spawn(function()
+		local model, root, hum = npc.model, npc.root, npc.humanoid
+		local owned = Net.claim(root, 1.5)
+		if not owned then
+			notify("Couldn't get ownership of that NPC - other players may not see it die")
+		end
+		pcall(function() hum.Health = 0 end)
+		local t0 = os.clock()
+		while os.clock() - t0 < 4 and model.Parent do
+			Net.apply()
+			pcall(function() hum.Health = 0 end)
+			task.wait(0.5)
+		end
+	end)
+end
+
+function Net.snapToRest(model, root)
+	local joints = {}
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("JointInstance") and d.Part0 and d.Part1 then
+			if d:IsA("Motor6D") then d.Transform = CFrame.new() end
+			table.insert(joints, d)
+		end
+	end
+	local placed = { [root] = true }
+	local progress = true
+	while progress do
+		progress = false
+		for _, j in ipairs(joints) do
+			local a, b = placed[j.Part0], placed[j.Part1]
+			if a and not b then
+				j.Part1.CFrame = j.Part0.CFrame * j.C0 * j.C1:Inverse()
+				placed[j.Part1] = true
+				progress = true
+			elseif b and not a then
+				j.Part0.CFrame = j.Part1.CFrame * j.C1 * j.C0:Inverse()
+				placed[j.Part0] = true
+				progress = true
+			end
+		end
+	end
+end
+
+Net.apply()
+
+--// NPC SYSTEM ---------------------------------------------------------------
+local function createAvatarModel()
+	local char, hum = getCharacter()
+	local model
+	if hum then
+		local ok, desc = pcall(function() return hum:GetAppliedDescription() end)
+		if ok and desc then
+			local ok2, m = pcall(function()
+				return Players:CreateHumanoidModelFromDescription(desc, hum.RigType)
+			end)
+			if ok2 and m then model = m end
+		end
+	end
+	if not model and char then
+		char.Archivable = true
+		model = char:Clone()
+	end
+	return model
+end
+
+local function cleanNpcModel(model)
+	model.Name = "MonkeyNPC"
+	local junk = {}
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("LuaSourceContainer") or d:IsA("Tool") or d:IsA("ForceField") then
+			table.insert(junk, d)
+		end
+	end
+	for _, d in ipairs(junk) do d:Destroy() end
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+		hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+		hum.RequiresNeck = false
+		hum.BreakJointsOnDeath = false
+		hum.WalkSpeed = 0
+	end
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if root then
+		root.Anchored = false
+		model.PrimaryPart = root
+	end
+end
+
+local function loadAnimations(npc)
+	local hum = npc.humanoid
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = hum
+	end
+	local ids
+	if hum.RigType == Enum.HumanoidRigType.R15 then
+		ids = { idle = "rbxassetid://507766666", walk = "rbxassetid://507777826", run = "rbxassetid://507767714" }
+	else
+		ids = { idle = "rbxassetid://180435571", walk = "rbxassetid://180426354", run = "rbxassetid://180426354" }
+	end
+	npc.tracks = {}
+	for name, id in pairs(ids) do
+		local a = Instance.new("Animation")
+		a.AnimationId = id
+		local ok, tr = pcall(function() return animator:LoadAnimation(a) end)
+		if ok and tr then
+			tr.Looped = true
+			npc.tracks[name] = tr
+		end
+	end
+end
+
+local function setAnim(npc, name)
+	if npc.currentAnim == name then return end
+	local old = npc.currentAnim and npc.tracks[npc.currentAnim]
+	if old then old:Stop(0.2) end
+	local new = npc.tracks[name]
+	if new then new:Play(0.2) end
+	npc.currentAnim = name
+end
+
+local function stopAnims(npc)
+	for _, t in pairs(npc.tracks) do
+		t:Stop(0.1)
+	end
+	npc.currentAnim = nil
+end
+
+local function spawnOneNpc()
+	if spawnedCount() >= settings.maxNpcs then
+		notify("NPC limit reached (" .. settings.maxNpcs .. ")")
+		return false
+	end
+	local char, hum, root = getCharacter()
+	if not char then
+		notify("No character found.")
+		return false
+	end
+	task.spawn(function()
+		local model = createAvatarModel()
+		if not model then
+			notify("Couldn't create an NPC.")
+			return
+		end
+		cleanNpcModel(model)
+		local nh = model:FindFirstChildOfClass("Humanoid")
+		local nr = model:FindFirstChild("HumanoidRootPart")
+		if not (nh and nr) then
+			model:Destroy()
+			notify("Couldn't create an NPC.")
+			return
+		end
+		if spawnedCount() >= settings.maxNpcs then
+			model:Destroy()
+			return
+		end
+
+		local angle = math.random() * math.pi * 2
+		local radius = math.random(18, 32)
+		local p = root.Position + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+		local hit = groundBelow(Vector3.new(p.X, root.Position.Y + 30, p.Z), { char, world })
+		local gy = hit and hit.Position.Y or (root.Position.Y - 3)
+		local spawnPos = Vector3.new(p.X, gy + nh.HipHeight + nr.Size.Y / 2 + 0.6, p.Z)
+		model:PivotTo(CFrame.new(spawnPos))
+		model.Parent = npcFolder
+
+		local npc = {
+			model = model, humanoid = nh, root = nr, home = spawnPos,
+			ragdolled = false, recoverAt = 0, hitCooldown = 0, hp = 100, dead = false,
+			nextWander = 0, target = nil, alertAt = 0,
+			lastPos = spawnPos, lastCheck = 0,
+			motors = {}, attachments = {}, tracks = {},
+		}
+		loadAnimations(npc)
+		table.insert(npcs, npc)
+	end)
+	return true
+end
+
+local function spawnNpcs(count)
+	local spawned = 0
+	for _ = 1, count do
+		if spawnOneNpc() then spawned += 1 else break end
+		task.wait(0.05)
+	end
+	if spawned > 0 then
+		notify(spawned == 1 and "NPC spawned" or (spawned .. " NPCs spawned"))
+	end
+end
+
+local function clearNpcs()
+	for i = #npcs, 1, -1 do
+		local npc = npcs[i]
+		if npc.real then
+			Adopt.hidden[npc.model] = nil
+			if npc.ragdolled and not npc.dead then Adopt.recover(npc) end
+		else
+			npc.model:Destroy()
+		end
+		table.remove(npcs, i)
+	end
+	notify("NPCs cleared")
+end
+
+--// ADOPT MAP NPCs --------------------------------------------------------------
+
+local function isMapNpc(h)
+	if not h:IsA("Humanoid") or h.Health <= 0 then return false end
+	local m = h.Parent
+	if not (m and m:IsA("Model")) or m:IsDescendantOf(world) then return false end
+	if Players:GetPlayerFromCharacter(m) then return false end
+	if player.Character and m == player.Character then return false end
+	return m:FindFirstChild("HumanoidRootPart") ~= nil and m:FindFirstChild("Head") ~= nil
+end
+
+function Adopt.setHidden(model, hide)
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			pcall(function()
+				if hide then
+					if Adopt.saved[d] == nil then Adopt.saved[d] = d.CanCollide end
+					d.LocalTransparencyModifier = 1
+					d.CanCollide = false
+				else
+					d.LocalTransparencyModifier = 0
+					if Adopt.saved[d] ~= nil then d.CanCollide = Adopt.saved[d] end
+				end
+			end)
+		end
+	end
+	local h = model:FindFirstChildOfClass("Humanoid")
+	if h then
+		pcall(function()
+			h.DisplayDistanceType = hide and Enum.HumanoidDisplayDistanceType.None or Enum.HumanoidDisplayDistanceType.Viewer
+		end)
+	end
+end
+
+function Adopt.release(model)
+	Adopt.hidden[model] = nil
+end
+
+function Adopt.take(h)
+	local model = h.Parent
+	if Adopt.hidden[model] then return end
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if not (root and model:FindFirstChild("Head")) then return end
+	Adopt.hidden[model] = true
+	local pos = root.Position
+	table.insert(npcs, {
+		model = model, humanoid = h, root = root, home = pos, real = true, adopted = true,
+		ragdolled = false, recoverAt = 0, hitCooldown = 0, hp = 100, dead = false,
+		alertAt = 0, lastPos = pos, lastCheck = 0,
+		motors = {}, attachments = {}, tracks = {},
+	})
+end
+
+local function trackHumanoid(inst)
+	if inst:IsA("Humanoid") then Adopt.known[inst] = true end
+end
+track(Workspace.DescendantAdded:Connect(trackHumanoid))
+track(Workspace.DescendantRemoving:Connect(function(inst)
+	Adopt.known[inst] = nil
+end))
+task.spawn(function()
+	local n = 0
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		trackHumanoid(d)
+		n += 1
+		if n % 4000 == 0 then task.wait() end
+	end
+end)
+
+function Adopt.tick(now, root)
+	Net.apply()
+	for model in pairs(Adopt.hidden) do
+		if not model.Parent then Adopt.hidden[model] = nil end
+	end
+	if not settings.adoptNpcs then
+		for i = #npcs, 1, -1 do
+			local npc = npcs[i]
+			if npc.adopted then
+				if npc.ragdolled and not npc.dead then Adopt.recover(npc) end
+				table.remove(npcs, i)
+			end
+		end
+		Adopt.releaseAll()
+		return
+	end
+	if not root then return end
+	local count = 0
+	for _, npc in ipairs(npcs) do
+		if npc.adopted then count += 1 end
+	end
+	if count >= settings.adoptMax then return end
+	for h in pairs(Adopt.known) do
+		if count >= settings.adoptMax then break end
+		if h.Parent and isMapNpc(h) and not Adopt.hidden[h.Parent] then
+			local hr = h.Parent:FindFirstChild("HumanoidRootPart")
+			if hr and (hr.Position - root.Position).Magnitude <= settings.adoptRange then
+				Adopt.take(h)
+				count += 1
+			end
+		end
+	end
+end
+
+function Adopt.releaseAll()
+	for model in pairs(Adopt.hidden) do Adopt.release(model) end
+end
+
+local function findNpcByPart(part)
+	local m = part:FindFirstAncestorOfClass("Model")
+	if not m then return nil end
+	for _, npc in ipairs(npcs) do
+		if npc.model == m then return npc end
+	end
+	return nil
+end
+
+local HIT_WORDS = { "BONK!", "POW!", "WHAM!", "OOF!", "BOING!" }
+local function impactEffect(pos, word, small)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Transparency = 1
+	p.Size = Vector3.one
+	p.Position = pos
+	p.Parent = fxFolder
+
+	local sparks = Instance.new("ParticleEmitter")
+	sparks.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+	sparks.Color = ColorSequence.new(C(255, 236, 120), C(255, 150, 40))
+	sparks.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, small and 1.0 or 1.8), NumberSequenceKeypoint.new(1, 0) })
+	sparks.Lifetime = NumberRange.new(0.3, 0.7)
+	sparks.Speed = NumberRange.new(20, 45)
+	sparks.SpreadAngle = Vector2.new(180, 180)
+	sparks.Drag = 3
+	sparks.LightEmission = 1
+	sparks.Rate = 0
+	sparks.Parent = p
+	sparks:Emit(small and 12 or 30)
+
+	local smoke = Instance.new("ParticleEmitter")
+	smoke.Texture = "rbxasset://textures/particles/smoke_main.dds"
+	smoke.Color = ColorSequence.new(C(220, 220, 220))
+	smoke.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2), NumberSequenceKeypoint.new(1, small and 4 or 7) })
+	smoke.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 1) })
+	smoke.Lifetime = NumberRange.new(0.6, 1.1)
+	smoke.Speed = NumberRange.new(6, 14)
+	smoke.SpreadAngle = Vector2.new(180, 180)
+	smoke.Rate = 0
+	smoke.Parent = p
+	smoke:Emit(small and 4 or 12)
+
+	local bb = Instance.new("BillboardGui")
+	bb.Size = UDim2.fromOffset(150, 50)
+	bb.StudsOffset = Vector3.new(0, 3, 0)
+	bb.AlwaysOnTop = true
+	bb.Parent = p
+	local tl = Instance.new("TextLabel")
+	tl.Size = UDim2.fromScale(1, 1)
+	tl.BackgroundTransparency = 1
+	tl.Text = word or HIT_WORDS[math.random(#HIT_WORDS)]
+	tl.Font = Enum.Font.GothamBlack
+	tl.TextScaled = true
+	tl.TextColor3 = C(255, 220, 60)
+	tl.TextStrokeColor3 = C(0, 0, 0)
+	tl.TextStrokeTransparency = 0
+	tl.Parent = bb
+	TweenService:Create(bb, TweenInfo.new(0.9), { StudsOffset = Vector3.new(0, 7, 0) }):Play()
+	TweenService:Create(tl, TweenInfo.new(0.9), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+
+	Debris:AddItem(p, 2)
+end
+
+--// SPEECH BUBBLES + DAMAGE NUMBERS ------------------------------------------
+local PAIN_LINES = {
+	head = { "AAAAH!", "My head!!", "I can't see!" },
+	arm = { "OWW! my hand!", "My arm!", "Ah! Damn!", "Stop it!" },
+	leg = { "My leg!", "I can't walk!", "Argh!" },
+	torso = { "I'm hit!", "Help me...", "Ugh!", "Why?!" },
+	car = { "WATCH OUT!", "My back!", "Ouch!!" },
+	dying = { "Help me...", "It hurts...", "I don't feel good...", "Somebody..." },
+	scared = { "!", "Watch out!", "A car!!", "Run!" },
+}
+local function pick(list) return list[math.random(#list)] end
+
+local TextChatService = game:GetService("TextChatService")
+local ChatService = game:GetService("Chat")
+pcall(function()
+	local cfg = TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
+	if cfg then cfg.Enabled = true end
+end)
+
+local function say(npc, text)
+	local head = npc.model and npc.model:FindFirstChild("Head")
+	if not head then return end
+	local shown = false
+	pcall(function()
+		if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+			TextChatService:DisplayBubble(head, text)
+			shown = true
+		end
+	end)
+	if not shown then
+		pcall(function() ChatService:Chat(head, text, Enum.ChatColor.White) end)
+	end
+end
+
+--// RAGDOLL ------------------------------------------------------------------
+local function ragdoll(npc, launch)
+	if npc.ragdolled then return end
+	npc.ragdolled = true
+	local model, hum, root = npc.model, npc.humanoid, npc.root
+	npc.wasAnchored = {}
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") and d.Anchored then
+			npc.wasAnchored[d] = true
+			d.Anchored = false
+		end
+	end
+	npc.rootCollide = root.CanCollide
+	if npc.real then
+		npc.oldNeck, npc.oldBreak = hum.RequiresNeck, hum.BreakJointsOnDeath
+		hum.RequiresNeck = false
+		hum.BreakJointsOnDeath = false
+		Net.apply()
+	end
+	stopAnims(npc)
+	hum:Move(Vector3.zero, false)
+	hum.AutoRotate = false
+	hum.PlatformStand = true
+	pcall(function() hum.EvaluateStateMachine = false end)
+	hum:ChangeState(Enum.HumanoidStateType.Physics)
+	root.CanCollide = false
+
+	local folder = Instance.new("Folder")
+	folder.Name = "RagdollParts"
+	folder.Parent = model
+	npc.ragFolder = folder
+
+	for _, m in ipairs(model:GetDescendants()) do
+		if m:IsA("Motor6D") and m.Name ~= "Root" and m.Name ~= "RootJoint" and m.Part0 and m.Part1 then
+			local nm = m.Name
+			local a0 = Instance.new("Attachment")
+			a0.Name = "MonkeyRagA0"
+			a0.CFrame = m.C0
+			a0.Parent = m.Part0
+			local a1 = Instance.new("Attachment")
+			a1.Name = "MonkeyRagA1"
+			a1.CFrame = m.C1
+			a1.Parent = m.Part1
+			local b = Instance.new("BallSocketConstraint")
+			b.Attachment0 = a0
+			b.Attachment1 = a1
+			b.LimitsEnabled = true
+			local hinge = nm:find("Elbow") or nm:find("Knee")
+			b.UpperAngle = hinge and 55 or ((nm == "Waist" or nm == "Neck") and 40 or 80)
+			b.TwistLimitsEnabled = true
+			b.TwistLowerAngle = hinge and -10 or -40
+			b.TwistUpperAngle = hinge and 10 or 40
+			b.MaxFrictionTorque = 3
+			b.Parent = folder
+			local nc = Instance.new("NoCollisionConstraint")
+			nc.Part0 = m.Part0
+			nc.Part1 = m.Part1
+			nc.Parent = folder
+			m.Enabled = false
+			table.insert(npc.motors, m)
+			table.insert(npc.attachments, a0)
+			table.insert(npc.attachments, a1)
+		end
+	end
+
+	for _, part in ipairs(model:GetChildren()) do
+		if part:IsA("BasePart") then
+			if part.Name ~= "HumanoidRootPart" then part.CanCollide = true end
+			for _, car in ipairs(cars) do
+				local nc = Instance.new("NoCollisionConstraint")
+				nc.Part0 = part
+				nc.Part1 = car.chassis
+				nc.Parent = folder
+			end
+		end
+	end
+
+	npc.recoverAt = os.clock() + 4 + math.random() * 2
+
+	task.spawn(function()
+		RunService.Heartbeat:Wait()
+		if not npc.root.Parent then return end
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") then
+				d.AssemblyLinearVelocity = launch
+			end
+		end
+		local torso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso") or npc.root
+		torso.AssemblyAngularVelocity = Vector3.new(math.random(-9, 9), math.random(-9, 9), math.random(-9, 9))
+	end)
+end
+
+local function recoverNpc(npc)
+	if npc.recovering or npc.dead then return end
+	npc.recovering = true
+	task.spawn(function()
+		local model, hum, root = npc.model, npc.humanoid, npc.root
+		if not (root and root.Parent and model.Parent) then
+			npc.recovering = false
+			return
+		end
+		Net.apply()
+		for _, a in ipairs(npc.attachments) do
+			if a.Parent then a:Destroy() end
+		end
+		if npc.ragFolder then npc.ragFolder:Destroy() end
+		local motors = npc.motors
+		npc.motors, npc.attachments, npc.ragFolder = {}, {}, nil
+
+		local rp = RaycastParams.new()
+		rp.FilterType = Enum.RaycastFilterType.Exclude
+		rp.FilterDescendantsInstances = player.Character and { model, world, player.Character } or { model, world }
+		local res = Workspace:Raycast(root.Position + Vector3.new(0, 3, 0), Vector3.new(0, -400, 0), rp)
+		local height
+		if hum.RigType == Enum.HumanoidRigType.R15 then
+			height = hum.HipHeight + root.Size.Y / 2
+		else
+			local leg = model:FindFirstChild("Left Leg")
+			height = (leg and leg.Size.Y or 2) + root.Size.Y / 2
+		end
+		local inAir = (not res) or (root.Position.Y - res.Position.Y) > height + 3
+		local y = inAir and root.Position.Y or (res.Position.Y + height + 0.15)
+		local look = root.CFrame.LookVector
+		local flat = Vector3.new(look.X, 0, look.Z)
+		if flat.Magnitude < 0.3 then
+			local up = root.CFrame.UpVector
+			flat = Vector3.new(up.X, 0, up.Z)
+		end
+		if flat.Magnitude < 0.3 then
+			flat = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5)
+		end
+		local yaw = math.atan2(-flat.Unit.X, -flat.Unit.Z)
+
+		local parts = {}
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") then
+				parts[#parts + 1] = d
+				d.Anchored = true
+				d.AssemblyLinearVelocity = Vector3.zero
+				d.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+		root.CFrame = CFrame.new(root.Position.X, y, root.Position.Z) * CFrame.Angles(0, yaw, 0)
+		Net.snapToRest(model, root)
+		for _, m in ipairs(motors) do
+			if m.Parent then m.Enabled = true end
+		end
+		if npc.rootCollide ~= nil then root.CanCollide = npc.rootCollide end
+		hum.AutoRotate = true
+		if npc.real and npc.oldNeck ~= nil then
+			hum.RequiresNeck = npc.oldNeck
+			hum.BreakJointsOnDeath = npc.oldBreak
+		end
+		hum.PlatformStand = false
+		pcall(function() hum.EvaluateStateMachine = true end)
+
+		task.wait(0.1)
+		if not model.Parent then
+			npc.recovering = false
+			return
+		end
+		for _, part in ipairs(parts) do
+			if part.Parent then
+				part.Anchored = npc.wasAnchored and npc.wasAnchored[part] or false
+				part.AssemblyLinearVelocity = Vector3.zero
+				part.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+		hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+		npc.ragdolled = false
+		npc.recovering = false
+		npc.hitCooldown = os.clock() + 1.5
+	end)
+end
+Adopt.recover = recoverNpc
+
+local function pushNpc(npc, vel)
+	for _, d in ipairs(npc.model:GetDescendants()) do
+		if d:IsA("BasePart") then d.AssemblyLinearVelocity += vel end
+	end
+end
+
+--// DAMAGE -------------------------------------------------------------------
+
+local function regionOf(part)
+	local n = part.Name
+	if n == "Head" then return "head" end
+	if part.Parent and part.Parent:IsA("Accessory") then
+		local att = part:FindFirstChildOfClass("Attachment")
+		if att and (att.Name:find("Hat") or att.Name:find("Hair") or att.Name:find("Face")) then return "head" end
+		return "torso"
+	end
+	if n:find("Arm") or n:find("Hand") then return "arm" end
+	if n:find("Leg") or n:find("Foot") then return "leg" end
+	return "torso"
+end
+
+local function killNpc(npc)
+	pcall(function()
+		for _, d in ipairs(npc.model:GetDescendants()) do
+			if d:IsA("Humanoid") then d.Health = 0 end
+		end
+	end)
+end
+
+local function damageNpc(npc, part, amount, dir, hitPos, force, cause)
+	local now = os.clock()
+	force = force or Vector3.zero
+	local region = (cause == "car") and "torso" or regionOf(part)
+
+	if npc.dead then
+		pushNpc(npc, force * 0.4)
+		return true, false
+	end
+
+	npc.hp -= amount
+	local killed = npc.hp <= 0
+	local fresh = not npc.ragdolled
+
+	if killed and npc.real then
+		npc.dead = true
+		npc.deadAt = now
+		npc.recoverAt = math.huge
+		killNpc(npc)
+		if not npc.realKilled then
+			npc.realKilled = true
+			Net.kill(npc)
+		end
+		playSound(SOUNDS.pain, npc.root, 0.8)
+		return true, true
+	end
+
+	if killed then
+		npc.dead = true
+		npc.deadAt = now
+		npc.recoverAt = math.huge
+	else
+		npc.recoverAt = now + (region == "leg" and 6.5 or 4.5)
+	end
+
+	if fresh then
+		ragdoll(npc, force)
+	else
+		pushNpc(npc, force * 0.5)
+	end
+	if killed then killNpc(npc) end
+	task.delay(0.06, function()
+		if part.Parent then
+			pcall(function()
+				part:ApplyImpulseAtPosition(dir * part.AssemblyMass * 16, hitPos)
+			end)
+		end
+	end)
+
+	say(npc, pick(cause == "car" and PAIN_LINES.car or PAIN_LINES[region]))
+	playSound(SOUNDS.pain, npc.root, 0.8)
+
+	if killed then
+		task.delay(1.3, function()
+			if npc.model and npc.model.Parent then say(npc, pick(PAIN_LINES.dying)) end
+		end)
+	end
+	return true, killed
+end
+
+local function alertBubble(npc, now)
+	if now < npc.alertAt then return end
+	npc.alertAt = now + 3
+	say(npc, pick(PAIN_LINES.scared))
+end
+
+local function stepNpc(npc, dt, now)
+	local hum, root = npc.humanoid, npc.root
+	if not (hum and hum.Parent and root and root.Parent and npc.model.Parent) then return false end
+	if root.Position.Y < -300 then return false end
+	if npc.real and not npc.dead and hum.Health <= 0 then return false end
+	if npc.real and npc.dead and not npc.ragdolled then return false end
+
+	if npc.ragdolled then
+		if npc.dead then
+			return now <= npc.deadAt + 8
+		end
+		if now >= npc.recoverAt then recoverNpc(npc) end
+		return true
+	end
+
+	local pos = root.Position
+	local alert = false
+
+	for _, car in ipairs(cars) do
+		local cc = car.chassis
+		if cc.Parent then
+			local cf = cc.CFrame
+			local v = cc.AssemblyLinearVelocity
+			local flatV = Vector3.new(v.X, 0, v.Z)
+			local spd = flatV.Magnitude
+
+			local rel = cf:PointToObjectSpace(pos)
+			if spd > 9 and now > npc.hitCooldown
+				and math.abs(rel.X) < car.width / 2 + 1.4
+				and math.abs(rel.Z) < car.length / 2 + 2.5
+				and math.abs(rel.Y) < car.rideH + 3 then
+				npc.hitCooldown = now + 1.5
+				local f = spd > 0.1 and flatV.Unit or cf.LookVector
+				local side = cf.RightVector * (math.random() * 2 - 1) * 25
+				local launch = f * math.clamp(spd * 0.9, 20, 120) + side + Vector3.new(0, math.clamp(20 + spd * 0.35, 25, 55), 0)
+				damageNpc(npc, root, 1e6, launch.Unit, pos, launch, "car")
+				return true
+			end
+
+			local toNpc = Vector3.new(pos.X - cf.Position.X, 0, pos.Z - cf.Position.Z)
+			local d = toNpc.Magnitude
+			if d < 22 + spd * 0.7 and d > 0.1 and math.abs(pos.Y - cf.Position.Y) < car.rideH + 8 then
+				if (spd > 4 and flatV:Dot(toNpc) > 0) or (spd > 2 and d < 10) then
+					alert = true
+				end
+			end
+		end
+	end
+	if alert then alertBubble(npc, now) end
+
+	if not npc.real then setAnim(npc, "idle") end
+	return true
+end
+
+--// VEHICLE SPECS ------------------------------------------------------------
+_G.__MonkeyFlips = _G.__MonkeyFlips or {}
+local VEHICLES = {
+	{ name = "2019 Sports Car", tag = "Rosh model", color = C(220, 40, 40), assetId = 6810376207,
+		length = 24, maxSpeed = 130, accel = 1.6, turn = 1.9 },
+	{ name = "Drift Car", tag = "Drift model", color = C(40, 40, 46), assetId = 10017069212,
+		length = 24, maxSpeed = 115, accel = 1.5, turn = 2.2 },
+	{ name = "Tesla", tag = "Electric model", color = C(235, 235, 240), assetId = 11667148523,
+		length = 25, maxSpeed = 140, accel = 1.8, turn = 1.8 },
+}
+
+local PAINTS = {
+	{ "Crimson", C(200, 28, 36) }, { "Orange", C(240, 120, 20) }, { "Gold", C(245, 195, 25) },
+	{ "Lime", C(110, 205, 50) }, { "Teal", C(0, 170, 170) }, { "Blue", C(28, 70, 190) },
+	{ "Purple", C(130, 50, 200) }, { "Pink", C(245, 90, 170) }, { "White", C(240, 240, 245) },
+	{ "Graphite", C(60, 62, 70) }, { "Black", C(14, 14, 16) },
+}
+
+--// VEHICLE BUILDER ----------------------------------------------------------
+local DARK = C(24, 24, 27)
+local CHROME = C(205, 210, 216)
+local GLASS = C(125, 165, 190)
+local SEATCOL = C(38, 38, 44)
+local TIRE = C(16, 16, 18)
+local IND_OFF, IND_ON = C(85, 52, 8), C(255, 150, 20)
+local TAIL_OFF, TAIL_ON = C(140, 15, 15), C(255, 35, 35)
+local REV_OFF, REV_ON = C(90, 90, 90), C(255, 255, 255)
+
+--// IMPORTED CAR MODELS (Creator Store assets) ------------------------------------
+-- Loads a car model by asset id, strips scripts/joints, lines it up (long axis = Z, front = -Z),
+-- scales it to spec.length, finds the wheels so they spin + steer, and plugs it into the same
+-- driving physics as the built-in cars. Needs an environment with game:GetObjects (executors).
+local assetCache = {}
+local lastFetchError = nil
+
+local function fetchAsset(id)
+	if assetCache[id] then return assetCache[id] end
+	local model
+	lastFetchError = nil
+	local ok, err = pcall(function()
+		local objs = game:GetObjects("rbxassetid://" .. id)
+		model = objs and objs[1]
+	end)
+	if not ok then lastFetchError = tostring(err) end
+	if not model then
+		local ok2, err2 = pcall(function()
+			model = game:GetService("InsertService"):LoadAsset(id)
+		end)
+		if not ok2 and not lastFetchError then lastFetchError = tostring(err2) end
+	end
+	if model then
+		local kids = model:GetChildren()
+		if model:IsA("Model") and #kids == 1 and kids[1]:IsA("Model") and not model.PrimaryPart then
+			model = kids[1]
+		end
+		if not model:IsA("Model") then
+			local wrap = Instance.new("Model")
+			model.Parent = wrap
+			model = wrap
+		end
+		assetCache[id] = model
+	end
+	return model
+end
+
+local function boundsOfParts(parts, frame)
+	local mn, mx
+	for _, d in ipairs(parts) do
+		local s = d.Size / 2
+		for _, sx in ipairs({ -1, 1 }) do
+			for _, sy in ipairs({ -1, 1 }) do
+				for _, sz in ipairs({ -1, 1 }) do
+					local p = frame:PointToObjectSpace((d.CFrame * CFrame.new(s.X * sx, s.Y * sy, s.Z * sz)).Position)
+					mn = mn and mn:Min(p) or p
+					mx = mx and mx:Max(p) or p
+				end
+			end
+		end
+	end
+	return mn, mx
+end
+
+local function visibleParts(model)
+	local list = {}
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") and d.Transparency < 0.95 then table.insert(list, d) end
+	end
+	return list
+end
+
+local function buildImportedCar(spec)
+	local tpl = fetchAsset(spec.assetId)
+	if not tpl then return nil end
+	local model = tpl:Clone()
+	model.Name = spec.name
+
+	local partCount = 0
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then partCount += 1 end
+	end
+	if partCount > MAX_CAR_PARTS then
+		model:Destroy()
+		notify(spec.name .. " has " .. partCount .. " parts (limit " .. MAX_CAR_PARTS .. ") - skipped to avoid lag")
+		return nil
+	end
+
+	local junk = {}
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("LuaSourceContainer") or d:IsA("Constraint") or d:IsA("JointInstance") or d:IsA("WeldConstraint")
+			or d:IsA("NoCollisionConstraint") or d:IsA("BodyMover") or d:IsA("ProximityPrompt")
+			or d:IsA("ClickDetector") or d:IsA("Sound") or d:IsA("Humanoid") or d:IsA("ForceField")
+			or d:IsA("ParticleEmitter") or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles")
+			or d:IsA("Beam") or d:IsA("Trail") or d:IsA("Light") or d:IsA("BillboardGui") then
+			table.insert(junk, d)
+		elseif d:IsA("Seat") or d:IsA("VehicleSeat") then
+			d.Disabled = true
+		end
+	end
+	for _, d in ipairs(junk) do d:Destroy() end
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Anchored = false
+			d.CanCollide = false
+			d.CanTouch = false
+			d.CanQuery = false
+			d.Massless = true
+			if d.Size.Magnitude < 2.5 then d.CastShadow = false end
+		end
+	end
+
+	local vis = visibleParts(model)
+	if #vis == 0 then model:Destroy() return nil end
+	local P = model:GetPivot()
+	local mn, mx = boundsOfParts(vis, P)
+	model:PivotTo(CFrame.new(-(mn + mx) / 2))
+	local size = mx - mn
+	if size.X > size.Z then
+		model:PivotTo(CFrame.Angles(0, math.rad(90), 0) * model:GetPivot())
+	end
+	local frontZ, rearZ, nf, nr = 0, 0, 0, 0
+	local FRONT = { "headlight", "headlamp", "hood", "bonnet", "grille", "grill", "front", "bumperf" }
+	local REAR = { "taillight", "brakelight", "trunk", "boot", "rear", "back", "exhaust", "spoiler", "wing", "diffuser" }
+	local function hasWord(n, list)
+		for _, w in ipairs(list) do
+			if n:find(w, 1, true) then return true end
+		end
+		return false
+	end
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") and math.abs(d.Position.Z) > 0.5 then
+			local a, isF, isR = d, false, false
+			while a and a ~= model do
+				local n = a.Name:lower()
+				if not n:find("seat") and not n:find("steer") then
+					if hasWord(n, FRONT) then isF = true end
+					if hasWord(n, REAR) then isR = true end
+				end
+				a = a.Parent
+			end
+			if isF and not isR then frontZ += d.Position.Z nf += 1 end
+			if isR and not isF then rearZ += d.Position.Z nr += 1 end
+		end
+	end
+	local score = 0
+	if nf > 0 then score += -frontZ / nf end
+	if nr > 0 then score += rearZ / nr end
+	if nf == 0 and nr == 0 then
+		local cz, cn = 0, 0
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") and d.Position.Y > -size.Y / 2 + size.Y * 0.6 and d.Transparency < 0.95 then
+				cz += d.Position.Z cn += 1
+			end
+		end
+		if cn > 0 then score = cz / cn end
+	end
+	local flip = score < 0
+	if _G.__MonkeyFlips[spec.assetId] then flip = not flip end
+	if flip then model:PivotTo(CFrame.Angles(0, math.rad(180), 0) * model:GetPivot()) end
+	vis = visibleParts(model)
+	mn, mx = boundsOfParts(vis, CFrame.new())
+	local factor = (spec.length or 24) / math.max(mx.Z - mn.Z, 0.1)
+	model:ScaleTo(model:GetScale() * factor)
+	vis = visibleParts(model)
+	mn, mx = boundsOfParts(vis, CFrame.new())
+	model:PivotTo(CFrame.new(-(mn + mx) / 2) * model:GetPivot())
+	mn, mx = boundsOfParts(visibleParts(model), CFrame.new())
+	local W, H, L = mx.X - mn.X, mx.Y - mn.Y, mx.Z - mn.Z
+
+	local groups = {}
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local match = false
+			local a = d
+			while a and a ~= model do
+				local n = a.Name:lower()
+				if n:find("steer") then match = false break end
+				if n:find("wheel") or n:find("tire") or n:find("tyre") or n:find("rim") then match = true end
+				a = a.Parent
+			end
+			local p = d.Position
+			if match and p.Y < 0 and math.abs(p.X) > W * 0.25 and math.max(d.Size.X, d.Size.Y, d.Size.Z) < L * 0.3 then
+				local key = (p.X < 0 and "L" or "R") .. (p.Z < 0 and "F" or "B")
+				groups[key] = groups[key] or { parts = {} }
+				table.insert(groups[key].parts, d)
+			end
+		end
+	end
+
+	local chassis = Instance.new("Part")
+	chassis.Name = "Chassis"
+	chassis.Size = Vector3.new(W * 0.92, H * 0.55, L * 0.95)
+	chassis.Transparency = 1
+	chassis.CFrame = CFrame.new()
+	chassis.CustomPhysicalProperties = PhysicalProperties.new(0.6, 0.3, 0.1)
+	chassis.Parent = model
+	model.PrimaryPart = chassis
+
+	local wheelPartSet = {}
+	for _, g in pairs(groups) do
+		for _, p in ipairs(g.parts) do wheelPartSet[p] = true end
+	end
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") and d ~= chassis and not wheelPartSet[d] then
+			local w = Instance.new("Weld")
+			w.Part0 = chassis
+			w.Part1 = d
+			w.C0 = chassis.CFrame:ToObjectSpace(d.CFrame)
+			w.Parent = d
+		end
+	end
+
+	local wheels, probe = {}, {}
+	local Rsum, Rn = 0, 0
+	for _, g in pairs(groups) do
+		local gmn, gmx = boundsOfParts(g.parts, CFrame.new())
+		local c, sz = (gmn + gmx) / 2, gmx - gmn
+		local hub = Instance.new("Part")
+		hub.Name = "WheelHub"
+		hub.Size = Vector3.new(0.2, 0.2, 0.2)
+		hub.Transparency = 1
+		hub.CanCollide = false
+		hub.CanTouch = false
+		hub.CanQuery = false
+		hub.Massless = true
+		hub.CFrame = CFrame.new(c)
+		hub.Parent = model
+		local hw = Instance.new("Weld")
+		hw.Part0 = chassis
+		hw.Part1 = hub
+		hw.C0 = CFrame.new(c)
+		hw.Parent = hub
+		for _, p in ipairs(g.parts) do
+			local w = Instance.new("Weld")
+			w.Part0 = hub
+			w.Part1 = p
+			w.C0 = hub.CFrame:ToObjectSpace(p.CFrame)
+			w.Parent = p
+		end
+		table.insert(wheels, { weld = hw, x = c.X, y = c.Y, z = c.Z, front = c.Z < 0, side = c.X < 0 and -1 or 1 })
+		table.insert(probe, { x = c.X, z = c.Z })
+		Rsum += (sz.Y + sz.Z) / 4
+		Rn += 1
+	end
+	local R = Rn > 0 and Rsum / Rn or H * 0.2
+	if #probe < 4 then
+		probe = {
+			{ x = -W * 0.4, z = -L * 0.31 }, { x = W * 0.4, z = -L * 0.31 },
+			{ x = -W * 0.4, z = L * 0.31 }, { x = W * 0.4, z = L * 0.31 },
+		}
+	end
+	local rideH = H / 2
+
+	local function attach(name, offset)
+		local a = Instance.new("Attachment")
+		a.Name = name
+		a.CFrame = offset
+		a.Parent = chassis
+		return a
+	end
+	local spots, tailGlows, nitroEmitters = {}, {}, {}
+	for _, s in ipairs({ -1, 1 }) do
+		local sp = Instance.new("SpotLight")
+		sp.Face = Enum.NormalId.Front
+		sp.Range = 80
+		sp.Angle = 70
+		sp.Brightness = 3
+		sp.Enabled = false
+		sp.Parent = attach("Head", CFrame.new(s * W * 0.32, -H * 0.1, -L / 2))
+		table.insert(spots, sp)
+		local pl = Instance.new("PointLight")
+		pl.Color = C(255, 30, 30)
+		pl.Range = 9
+		pl.Brightness = 1.6
+		pl.Enabled = false
+		pl.Parent = attach("Tail", CFrame.new(s * W * 0.32, -H * 0.05, L / 2))
+		table.insert(tailGlows, pl)
+		local e = Instance.new("ParticleEmitter")
+		e.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+		e.Color = ColorSequence.new(C(190, 230, 255), C(50, 130, 255))
+		e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2.0), NumberSequenceKeypoint.new(1, 0) })
+		e.Lifetime = NumberRange.new(0.18, 0.32)
+		e.Speed = NumberRange.new(36, 55)
+		e.SpreadAngle = Vector2.new(6, 6)
+		e.LightEmission = 1
+		e.Rate = 0
+		e.EmissionDirection = Enum.NormalId.Back
+		e.Parent = attach("Nitro", CFrame.new(s * W * 0.25, -H * 0.2, L / 2 + 0.2))
+		table.insert(nitroEmitters, e)
+	end
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.ObjectText = spec.name
+	prompt.ActionText = "Drive"
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = math.max(14, L * 0.7)
+	prompt.RequiresLineOfSight = false
+	prompt.Parent = chassis
+
+	return {
+		model = model, chassis = chassis, spec = spec, prompt = prompt,
+		rideH = rideH, wheels = wheels, probe = probe, wheelR = R,
+		length = L, width = W, top = H / 2, roofY = H / 2,
+		body = spec.color, bodyParts = {},
+		headlights = spots, taillights = {}, tailGlows = tailGlows, reverseLights = {},
+		signals = { left = {}, right = {} }, siren = nil, glow = nil,
+		smokeEmitters = {}, flameEmitters = {}, nitroEmitters = nitroEmitters,
+		slipEmitters = {}, trails = {},
+		swWeld = nil, swBase = nil,
+		seatOffset = CFrame.new(-W * 0.22, -H / 2 + math.clamp(H * 0.55, 2.6, 4.2), -L * 0.02),
+		speed = 0, lat = 0, spin = 0, steerIn = 0, normal = Vector3.yAxis,
+		wasGrounded = true, lightsOn = false, lightsManual = nil, braking = false, reversing = false,
+		nitro = 100, boosting = false, prevThrottle = 0, signal = 0, lastBlink = nil,
+		driver = nil, seatWeld = nil, enteredAt = 0,
+	}
+end
+
+local function buildCar(spec, paintColor)
+	local ok, car = pcall(buildImportedCar, spec)
+	if ok and car then return car end
+	if not ok then warn("[Car Spawner] import failed: " .. tostring(car)) end
+	local why = lastFetchError and lastFetchError ~= "" and (": " .. lastFetchError:sub(1, 80))
+		or " - this needs an executor that supports game:GetObjects"
+	notify("Couldn't load " .. spec.name .. why)
+	return nil
+end
+
+--// VEHICLE CONTROL ----------------------------------------------------------
+local enterCar, exitCar, removeCar, flipCar
+local camState = { heading = nil, pos = nil, yaw = 0, pitch = 0, lastLook = 0, scripted = false, baseFov = 70 }
+
+local function keyDown(k)
+	return UserInputService:IsKeyDown(k)
+end
+
+local function readDriveInput(car, hum)
+	local throttle, steer = 0, 0
+	local brake, nitro = touch.brake, touch.nitro
+
+	if not UserInputService:GetFocusedTextBox() then
+		local f = (keyDown(Enum.KeyCode.W) or keyDown(Enum.KeyCode.Up)) and 1 or 0
+		f -= (keyDown(Enum.KeyCode.S) or keyDown(Enum.KeyCode.Down)) and 1 or 0
+		local s = (keyDown(Enum.KeyCode.D) or keyDown(Enum.KeyCode.Right)) and 1 or 0
+		s -= (keyDown(Enum.KeyCode.A) or keyDown(Enum.KeyCode.Left)) and 1 or 0
+		throttle, steer = f, s
+		if keyDown(Enum.KeyCode.Space) then brake = true end
+		if keyDown(Enum.KeyCode.LeftShift) then nitro = true end
+
+		pcall(function()
+			if UserInputService.GamepadEnabled then
+				for _, st in ipairs(UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)) do
+					if st.KeyCode == Enum.KeyCode.ButtonR2 then
+						throttle += st.Position.Z
+					elseif st.KeyCode == Enum.KeyCode.ButtonL2 then
+						throttle -= st.Position.Z
+					end
+				end
+				if UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonA) then brake = true end
+				if UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonX) then nitro = true end
+			end
+		end)
+		throttle = math.clamp(throttle, -1, 1)
+	end
+
+	if throttle == 0 and steer == 0 and hum then
+		local md = hum.MoveDirection
+		if md.Magnitude > 0.1 then
+			local cf = car.chassis.CFrame
+			local fl = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+			local rt = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+			if fl.Magnitude > 0.1 and rt.Magnitude > 0.1 then
+				throttle = md:Dot(fl.Unit)
+				steer = md:Dot(rt.Unit)
+			end
+		end
+	end
+	return throttle, steer, brake, nitro
+end
+
+local function setLights(car, on)
+	if car.lightsOn == on then return end
+	car.lightsOn = on
+	for _, sp in ipairs(car.headlights) do sp.Enabled = on end
+end
+
+local function setTail(car, state)
+	if car.tailState == state then return end
+	car.tailState = state
+	local col = state == 2 and TAIL_ON or (state == 1 and C(205, 22, 22) or TAIL_OFF)
+	for _, t in ipairs(car.taillights) do t.Color = col end
+	for _, g in ipairs(car.tailGlows) do g.Enabled = state == 2 end
+end
+
+local function setReverse(car, on)
+	if car.reversing == on then return end
+	car.reversing = on
+	for _, p in ipairs(car.reverseLights) do p.Color = on and REV_ON or REV_OFF end
+end
+
+local function setGlow(car, on)
+	local g = car.glow
+	if not g or g.on == on then return end
+	g.on = on
+	g.light.Enabled = on
+	for _, p in ipairs(g.parts) do
+		p.Transparency = on and 0 or 1
+	end
+end
+
+local function setSiren(car, on)
+	local sr = car.siren
+	if not sr then return end
+	sr.on = on
+	if not on then
+		sr.red.Color = C(110, 10, 10)
+		sr.blue.Color = C(10, 20, 110)
+		sr.rl.Enabled = false
+		sr.bl.Enabled = false
+		sr.lastPhase = nil
+	end
+end
+
+local function repaintCar(car, color)
+	car.body = color
+	for _, p in ipairs(car.bodyParts) do
+		if p.Parent then p.Color = color end
+	end
+end
+
+local function updateCarAudio(car, dt, driven, throttle, slip, boosting)
+	local a = car.audio
+	if not a then
+		if not driven then return end
+		a = { rpm = 0.2 }
+		local snd = Instance.new("Sound")
+		snd.SoundId = ENGINE_LOOP_ID
+		snd.Looped = true
+		snd.Volume = 0
+		snd.RollOffMode = Enum.RollOffMode.InverseTapered
+		snd.RollOffMinDistance = 14
+		snd.RollOffMaxDistance = 260
+		snd.Parent = car.chassis
+		pcall(function() snd:Play() end)
+		a.engine = snd
+		car.audio = a
+	end
+	local snd = a.engine
+	if not (driven and settings.sounds) then
+		snd.Volume = 0
+		return
+	end
+	if not snd.IsPlaying then pcall(function() snd:Play() end) end
+	local maxSpd = car.spec.maxSpeed * settings.speedMult
+	local ratio = math.clamp(math.abs(car.speed) / maxSpd, 0, 1.4)
+	local band = (ratio * 6) % 1
+	if ratio >= 1 then band = 1 end
+	a.rpm += ((0.2 + band * 0.8) - a.rpm) * math.clamp(dt * 8, 0, 1)
+	snd.PlaybackSpeed = 0.7 + a.rpm * 0.8
+	snd.Volume = (0.2 + 0.6 * a.rpm * (0.45 + 0.55 * math.abs(throttle))) * settings.volume
+end
+
+local function parkCar(car)
+	car.parked = true
+	for _, e in ipairs(car.nitroEmitters) do e.Rate = 0 end
+	for _, e in ipairs(car.slipEmitters) do e.Rate = 0 end
+	for _, t in ipairs(car.trails) do t.Enabled = false end
+	car.chassis.AssemblyLinearVelocity = Vector3.zero
+	car.chassis.AssemblyAngularVelocity = Vector3.zero
+	car.chassis.Anchored = true
+end
+
+-- Pushes loose (unanchored) parts out of the way. Works on parts your own client is simulating
+-- (normally the ones near you); parts the server is simulating can't be moved from here.
+local Push = { params = OverlapParams.new() }
+Push.params.FilterType = Enum.RaycastFilterType.Exclude
+Push.params.MaxParts = 60
+
+function Push.run(car, dt, cf, speed, fwd)
+	if math.abs(speed) < 3 then return end
+	car.pushAcc = (car.pushAcc or 0) + dt
+	if car.pushAcc < (settings.lowLag and 0.1 or 0.033) then return end
+	car.pushAcc = 0
+	local sign = speed >= 0 and 1 or -1
+	local dir = fwd * sign
+	local center = cf * CFrame.new(0, 0, -sign * (car.length / 2 + 1.5))
+	local filter = { world }
+	if player.Character then table.insert(filter, player.Character) end
+	Push.params.FilterDescendantsInstances = filter
+	local parts = Workspace:GetPartBoundsInBox(center, Vector3.new(car.width + 1, car.top * 1.8, 4), Push.params)
+	local want = math.abs(speed) * 1.05
+	local seen = {}
+	for _, p in ipairs(parts) do
+		if not p.Anchored and p.CanCollide then
+			local r = p.AssemblyRootPart
+			if r and not r.Anchored and not seen[r] then
+				seen[r] = true
+				local m = p:FindFirstAncestorOfClass("Model")
+				if not (m and m:FindFirstChildOfClass("Humanoid")) and not p:FindFirstAncestorOfClass("Tool")
+					and not p:FindFirstAncestorOfClass("Accessory") then
+					local v = r.AssemblyLinearVelocity
+					local cur = v:Dot(dir)
+					if cur < want then
+						r.AssemblyLinearVelocity = v + dir * (want - cur)
+					end
+				end
+			end
+		end
+	end
+end
+
+local function stepCar(car, dt, now, hum)
+	local chassis = car.chassis
+	local spec = car.spec
+	local cf = chassis.CFrame
+	local vel = chassis.AssemblyLinearVelocity
+	local driven = (car == drivenCar)
+
+	local throttle, steer, handbrake, nitroKey = 0, 0, false, false
+	if driven then
+		throttle, steer, handbrake, nitroKey = readDriveInput(car, hum)
+	end
+
+	local down = Vector3.new(0, -(car.rideH + 4), 0)
+	local pts, dists = {}, {}
+	local hits, sumDist = 0, 0
+	for i, pr in ipairs(car.probe) do
+		local o = cf:PointToWorldSpace(Vector3.new(pr.x, 0, pr.z))
+		local r = Workspace:Raycast(o, down, rayParams)
+		if r then
+			hits += 1
+			pts[i] = r.Position
+			dists[i] = o.Y - r.Position.Y
+			sumDist += dists[i]
+		end
+	end
+
+	local grounded, dist, n = false, 0, Vector3.yAxis
+	if hits > 0 then
+		grounded = true
+		dist = (sumDist / hits) * math.clamp(car.normal.Y, 0.3, 1)
+		local nn
+		if hits == 4 then
+			nn = (pts[2] - pts[3]):Cross(pts[1] - pts[4])
+		elseif hits == 3 then
+			local idx = {}
+			for i = 1, 4 do
+				if pts[i] then table.insert(idx, i) end
+			end
+			nn = (pts[idx[2]] - pts[idx[1]]):Cross(pts[idx[3]] - pts[idx[1]])
+		end
+		if nn and nn.Magnitude > 0.1 then
+			nn = nn.Unit
+			if nn.Y < 0 then nn = -nn end
+			if nn.Y > 0.5 then n = nn end
+		end
+	end
+	if dist > car.rideH + (car.wasGrounded and 3.2 or 1.5) then grounded = false end
+	if cf.UpVector.Y < 0.15 then grounded = false end
+
+	car.normal = car.normal:Lerp(n, math.clamp(dt * 8, 0, 1))
+	if car.normal.Magnitude < 0.1 then
+		car.normal = Vector3.yAxis
+	else
+		car.normal = car.normal.Unit
+	end
+	local nrm = car.normal
+
+	local fwd = cf.LookVector - nrm * cf.LookVector:Dot(nrm)
+	if fwd.Magnitude < 0.1 then
+		fwd = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+	end
+	if fwd.Magnitude < 0.1 then
+		fwd = Vector3.new(0, 0, -1)
+	end
+	fwd = fwd.Unit
+	local right = fwd:Cross(nrm)
+	if right.Magnitude < 0.1 then right = cf.RightVector else right = right.Unit end
+
+	local vTan = vel - nrm * vel:Dot(nrm)
+	local actualF = vTan:Dot(fwd)
+	local actualR = vTan:Dot(right)
+	if grounded then
+		if not car.wasGrounded then
+			car.speed = actualF
+		elseif math.abs(actualF) < math.abs(car.speed) - 30 then
+			car.speed = actualF
+		end
+	end
+	car.wasGrounded = grounded
+
+	local maxSpd = spec.maxSpeed * settings.speedMult
+	local accelMul = 1
+	local boosting = false
+	if driven and nitroKey and car.nitro > 1 and throttle > 0.05 then
+		boosting = true
+		maxSpd *= 1.45
+		accelMul = 2.4
+		car.nitro = math.max(0, car.nitro - 30 * dt)
+	else
+		car.nitro = math.min(100, car.nitro + (driven and 5 or 12) * dt)
+	end
+	car.boosting = boosting
+
+	local target = 0
+	if throttle > 0.05 then
+		target = throttle * maxSpd
+	elseif throttle < -0.05 then
+		target = throttle * maxSpd * 0.35
+	end
+	local rate
+	if driven and handbrake then
+		target = throttle > 0.05 and target * 0.5 or 0
+		rate = 1.3
+	elseif driven and math.abs(throttle) > 0.05 then
+		rate = (car.speed * throttle < 0) and 3.0 or spec.accel * accelMul
+	else
+		rate = driven and 0.45 or 1.6
+	end
+	car.speed += (target - car.speed) * math.clamp(rate * dt, 0, 1)
+
+	car.steerIn += (steer - car.steerIn) * math.clamp(dt * 9, 0, 1)
+	local absSpd = math.abs(car.speed)
+	local sf = math.clamp(absSpd / 18, 0, 1) * (1 - 0.35 * math.clamp(absSpd / math.max(maxSpd, 1), 0, 1))
+	local dir = car.speed >= 0 and 1 or -1
+	local yaw = -car.steerIn * spec.turn * sf * dir * ((driven and handbrake) and 1.5 or 1)
+
+	local gripBase = 7 * settings.grip
+	local grip = gripBase
+	if driven and handbrake and absSpd > 15 then grip = gripBase * 0.12 end
+	if absSpd < 8 then grip = math.max(grip, 10) end
+	local lat = actualR * math.exp(-grip * dt)
+	car.lat = lat
+	car.speed -= math.sign(car.speed) * math.min(math.abs(lat), 40) * 0.35 * dt
+
+	local slip = grounded and driven and (math.abs(lat) > 9
+		or (handbrake and absSpd > 18)
+		or (throttle > 0.9 and car.speed > 0 and absSpd < 10 and spec.accel >= 1.4))
+
+	if grounded then
+		local vnTarget = math.clamp((car.rideH - dist) * 10, -18, 14)
+		car.vn = (car.vn or 0) + (vnTarget - (car.vn or 0)) * math.clamp(dt * 18, 0, 1)
+		chassis.AssemblyLinearVelocity = fwd * car.speed + right * lat + nrm * car.vn
+		local tilt = cf.UpVector:Cross(nrm) * 12
+		chassis.AssemblyAngularVelocity = tilt + nrm * yaw
+		Push.run(car, dt, cf, car.speed, fwd)
+	else
+		local tilt = cf.UpVector:Cross(Vector3.yAxis) * 3
+		chassis.AssemblyAngularVelocity = chassis.AssemblyAngularVelocity * (1 - math.clamp(dt * 2, 0, 1)) + tilt * dt * 5
+	end
+
+	if driven then
+		if cf.UpVector.Y < 0.25 then
+			car.flipTimer = (car.flipTimer or 0) + dt
+			if car.flipTimer > 2.5 then
+				car.flipTimer = 0
+				flipCar(car)
+				notify("Flipped back upright")
+			end
+		else
+			car.flipTimer = 0
+		end
+	end
+
+	car.spin -= car.speed / car.wheelR * dt
+	local steerCF = CFrame.Angles(0, -car.steerIn * 0.5, 0)
+	local spinCF = CFrame.Angles(car.spin, 0, 0)
+	local w0 = car.wheelR - car.rideH
+	for i, w in ipairs(car.wheels) do
+		local d = dists[i]
+		local ty = w0 - 0.5
+		if d then ty = math.clamp(car.wheelR - d, w0 - 0.5, w0 + 0.7) end
+		w.y += (ty - w.y) * math.clamp(dt * 14, 0, 1)
+		local base = CFrame.new(w.x, w.y, w.z)
+		if w.front then
+			w.weld.C0 = base * steerCF * spinCF
+		else
+			w.weld.C0 = base * spinCF
+		end
+	end
+	if car.swWeld then
+		car.swWeld.C0 = car.swBase * CFrame.Angles(car.steerIn * 2.4, 0, 0)
+	end
+
+	local wantLights
+	if car.lightsManual ~= nil then wantLights = car.lightsManual else wantLights = driven and settings.autoLights end
+	setLights(car, wantLights and true or false)
+	local braking = driven and ((throttle * car.speed < -1) or handbrake)
+	setTail(car, braking and 2 or (wantLights and 1 or 0))
+	setReverse(car, driven and car.speed < -1 and throttle < -0.05)
+
+	local sig = car.signal
+	local blinkOn = sig ~= 0 and (math.floor(now * 2.6) % 2 == 0)
+	if car.lastBlink ~= blinkOn or car.lastSig ~= sig then
+		car.lastBlink, car.lastSig = blinkOn, sig
+		local lOn = blinkOn and (sig == -1 or sig == 2)
+		local rOn = blinkOn and (sig == 1 or sig == 2)
+		for _, p in ipairs(car.signals.left) do p.Color = lOn and IND_ON or IND_OFF end
+		for _, p in ipairs(car.signals.right) do p.Color = rOn and IND_ON or IND_OFF end
+	end
+
+	local sr = car.siren
+	if sr and sr.on then
+		local ph = math.floor(now * 8) % 8
+		if sr.lastPhase ~= ph then
+			sr.lastPhase = ph
+			local redOn = (ph == 0 or ph == 2)
+			local blueOn = (ph == 4 or ph == 6)
+			sr.red.Color = redOn and C(255, 30, 30) or C(110, 10, 10)
+			sr.blue.Color = blueOn and C(50, 90, 255) or C(10, 20, 110)
+			sr.rl.Enabled = redOn
+			sr.bl.Enabled = blueOn
+		end
+	end
+
+	if car.glow then
+		local want
+		if car.glowManual ~= nil then want = car.glowManual else want = settings.underglow end
+		setGlow(car, want and true or false)
+	end
+
+	local smokeRate = 0
+	if settings.smoke and not settings.lowLag and driven then
+		smokeRate = 3 + ((absSpd > 3) and math.abs(throttle) * 12 or 0)
+	end
+	if car.lastSmoke ~= smokeRate then
+		car.lastSmoke = smokeRate
+		for _, e in ipairs(car.smokeEmitters) do e.Rate = smokeRate end
+	end
+	local boostRate = boosting and 140 or 0
+	if car.lastBoost ~= boostRate then
+		car.lastBoost = boostRate
+		for _, e in ipairs(car.nitroEmitters) do e.Rate = boostRate end
+	end
+	if driven and car.prevThrottle > 0.6 and throttle < 0.2 and car.speed > maxSpd * 0.55 then
+		for _, e in ipairs(car.flameEmitters) do e:Emit(8) end
+	end
+	car.prevThrottle = throttle
+	updateCarAudio(car, dt, driven, throttle, slip and true or false, boosting and true or false)
+
+	local slipRate = (slip and settings.smoke and not settings.lowLag) and 55 or 0
+	if car.lastSlip ~= slipRate then
+		car.lastSlip = slipRate
+		for _, e in ipairs(car.slipEmitters) do e.Rate = slipRate end
+	end
+	local skid = (slip and settings.skidMarks and not settings.lowLag) and true or false
+	for _, t in ipairs(car.trails) do
+		if t.Enabled ~= skid then t.Enabled = skid end
+	end
+
+	if not driven then
+		if grounded and absSpd < 0.4 and math.abs(lat) < 0.4 then
+			car.idleT = (car.idleT or 0) + dt
+			if car.idleT > 0.6 then parkCar(car) end
+		else
+			car.idleT = 0
+		end
+	end
+end
+
+removeCar = function(car)
+	if car.driver then exitCar(car, true) end
+	local i = table.find(cars, car)
+	if i then table.remove(cars, i) end
+	if car.model then car.model:Destroy() end
+end
+
+flipCar = function(car)
+	car = car or drivenCar or cars[#cars]
+	if not car or not car.chassis.Parent then return end
+	local cf = car.chassis.CFrame
+	local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+	if look.Magnitude < 0.1 then look = Vector3.new(0, 0, -1) end
+	local p = cf.Position + Vector3.new(0, car.rideH + 3, 0)
+	car.parked, car.idleT = false, 0
+	car.chassis.Anchored = false
+	car.model:PivotTo(CFrame.lookAt(p, p + look.Unit))
+	car.chassis.AssemblyLinearVelocity = Vector3.zero
+	car.chassis.AssemblyAngularVelocity = Vector3.zero
+	car.speed, car.lat = 0, 0
+end
+
+local function restoreCamera()
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+	cam.FieldOfView = camState.baseFov
+	if camState.scripted then
+		camState.scripted = false
+		cam.CameraType = Enum.CameraType.Custom
+		local _, hum = getCharacter()
+		if hum then cam.CameraSubject = hum end
+	end
+end
+
+enterCar = function(car)
+	if not car or not car.chassis.Parent then return end
+	if drivenCar == car then return end
+	local char, hum, root = getCharacter()
+	if not char then
+		notify("No character found.")
+		return
+	end
+	if drivenCar then
+		exitCar(drivenCar, true)
+		char, hum, root = getCharacter()
+		if not char then return end
+	end
+	if car.driver then return end
+
+	car.driver = { char = char, hum = hum, root = root }
+	car.enteredAt = os.clock()
+	car.prompt.Enabled = false
+	car.parked, car.idleT = false, 0
+	car.chassis.Anchored = false
+	drivenCar = car
+	Net.apply()
+
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.CFrame = car.chassis.CFrame * car.seatOffset
+	car.driverCollide = {}
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("BasePart") and d.CanCollide then
+			car.driverCollide[d] = true
+			d.CanCollide = false
+		end
+	end
+	hum.Sit = true
+	hum:ChangeState(Enum.HumanoidStateType.Seated)
+
+	pcall(function()
+		ContextActionService:BindActionAtPriority("MonkeyDriveSink", function()
+			return Enum.ContextActionResult.Sink
+		end, false, Enum.ContextActionPriority.High.Value + 10, Enum.KeyCode.Space, Enum.KeyCode.ButtonA)
+	end)
+
+	local cam = Workspace.CurrentCamera
+	if cam then camState.baseFov = cam.FieldOfView end
+	camState.heading, camState.pos, camState.yaw, camState.pitch = nil, nil, 0, 0
+
+	notify(car.spec.name .. " - F to exit, Shift = nitro, Space = handbrake")
+end
+
+exitCar = function(car, silent)
+	if not car or not car.driver then return end
+	local d = car.driver
+	car.driver = nil
+	if drivenCar == car then drivenCar = nil end
+	Net.restore()
+	pcall(function() ContextActionService:UnbindAction("MonkeyDriveSink") end)
+	if car.seatWeld then
+		car.seatWeld:Destroy()
+		car.seatWeld = nil
+	end
+	if car.prompt and car.prompt.Parent then car.prompt.Enabled = true end
+	touch.nitro, touch.brake = false, false
+	restoreCamera()
+
+	if car.driverCollide then
+		for part in pairs(car.driverCollide) do
+			if part.Parent then part.CanCollide = true end
+		end
+		car.driverCollide = nil
+	end
+	local hum, root = d.hum, d.root
+	if hum and hum.Parent then hum.Sit = false end
+	if root and root.Parent and car.chassis.Parent and hum and hum.Health > 0 then
+		local cf = car.chassis.CFrame
+		local pos = cf.Position - cf.RightVector * (car.width / 2 + 3.5)
+		local hit = groundBelow(pos + Vector3.new(0, 10, 0), { d.char, world })
+		local gy = hit and hit.Position.Y or (cf.Position.Y - car.rideH)
+		local standY = gy + hum.HipHeight + root.Size.Y / 2 + 0.5
+		local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+		if look.Magnitude < 0.1 then look = Vector3.new(0, 0, -1) end
+		local p = Vector3.new(pos.X, standY, pos.Z)
+		root.CFrame = CFrame.lookAt(p, p + look.Unit)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end
+	if not silent then notify("Exited " .. car.spec.name) end
+end
+
+local function nearestCar(maxDist)
+	local _, _, root = getCharacter()
+	local refPos = root and root.Position
+	if not refPos then return nil end
+	local best, bestD = nil, maxDist or math.huge
+	for _, car in ipairs(cars) do
+		if car.chassis.Parent and not car.driver then
+			local d = (car.chassis.Position - refPos).Magnitude
+			if d < bestD then best, bestD = car, d end
+		end
+	end
+	return best
+end
+
+local function spawnVehicle(spec)
+	local char, hum, root = getCharacter()
+	if not char then
+		notify("No character found.")
+		return
+	end
+	if drivenCar then
+		exitCar(drivenCar, true)
+		char, hum, root = getCharacter()
+		if not char then return end
+	end
+	while #cars >= settings.maxVehicles do
+		removeCar(cars[1])
+	end
+
+	if spec.assetId and not assetCache[spec.assetId] then notify("Loading " .. spec.name .. "...") end
+	local car = buildCar(spec, settings.paint)
+	if not car then return end
+	local forward = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+	if forward.Magnitude < 0.1 then forward = Vector3.new(0, 0, -1) end
+	forward = forward.Unit
+
+	local pos = root.Position + forward * (spec.length * 0.5 + 8)
+	local hit = groundBelow(Vector3.new(pos.X, root.Position.Y + 10, pos.Z), { char, world })
+	local gy = hit and hit.Position.Y or (root.Position.Y - 3)
+	local p = Vector3.new(pos.X, gy + car.rideH + 0.3, pos.Z)
+
+	car.model:PivotTo(CFrame.lookAt(p, p + forward))
+	car.model.Parent = carFolder
+	table.insert(cars, car)
+
+	car.prompt.Triggered:Connect(function()
+		enterCar(car)
+	end)
+
+	if settings.autoEnter then
+		task.defer(function()
+			task.wait(0.1)
+			if car.model.Parent then enterCar(car) end
+		end)
+		notify(spec.name .. " spawned")
+	else
+		notify(spec.name .. " spawned - walk up and press E")
+	end
+end
+
+local function removeAllCars()
+	for i = #cars, 1, -1 do
+		removeCar(cars[i])
+	end
+	notify("Vehicles removed")
+end
+
+--// CHASE CAMERA ------------------------------------------------------------
+local function updateCamera(dt)
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+	local car = drivenCar
+	if car and car.chassis.Parent then
+		local cf = car.chassis.CFrame
+		local spdRatio = math.clamp(math.abs(car.speed) / (car.spec.maxSpeed * settings.speedMult), 0, 1.5)
+
+		if settings.chaseCam then
+			if cam.CameraType ~= Enum.CameraType.Scriptable then
+				cam.CameraType = Enum.CameraType.Scriptable
+				camState.scripted = true
+			end
+			local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+			if look.Magnitude < 0.1 then look = camState.heading or Vector3.new(0, 0, -1) end
+			look = look.Unit
+			if camState.heading then
+				camState.heading = camState.heading:Lerp(look, math.clamp(dt * 4.5, 0, 1))
+			else
+				camState.heading = look
+			end
+			if camState.heading.Magnitude < 0.1 then camState.heading = look end
+			local hv = camState.heading.Unit
+
+			if os.clock() - camState.lastLook > 1.8 then
+				local k = 1 - math.clamp(dt * 3, 0, 1)
+				camState.yaw *= k
+				camState.pitch *= k
+			end
+			local dirv = CFrame.Angles(0, camState.yaw, 0):VectorToWorldSpace(hv)
+			local big = car.spec.monster and 8 or 0
+			local dist = car.length * 0.5 + 11 + spdRatio * 4 + big
+			local focus = cf.Position + Vector3.new(0, car.top + 2.6, 0)
+			local desired = focus - dirv * dist + Vector3.new(0, 3.5 + dist * 0.12 + camState.pitch * 14 + big * 0.4, 0)
+			local ray = Workspace:Raycast(focus, desired - focus, rayParams)
+			if ray then desired = ray.Position + ray.Normal * 0.7 end
+			if camState.pos then
+				camState.pos = camState.pos:Lerp(desired, 1 - math.exp(-dt * 14))
+			else
+				camState.pos = desired
+			end
+			cam.CFrame = CFrame.lookAt(camState.pos, focus)
+			cam.Focus = CFrame.new(focus)
+		elseif camState.scripted then
+			camState.scripted = false
+			cam.CameraType = Enum.CameraType.Custom
+			local _, hum = getCharacter()
+			if hum then cam.CameraSubject = hum end
+		end
+
+		if settings.fovEffect then
+			local target = camState.baseFov + spdRatio * 16 + (car.boosting and 10 or 0)
+			cam.FieldOfView += (target - cam.FieldOfView) * math.clamp(dt * 5, 0, 1)
+		elseif cam.FieldOfView ~= camState.baseFov then
+			cam.FieldOfView = camState.baseFov
+		end
+	end
+
+end
+
+--// CAR SEARCH (Creator Store) -----------------------------------------------
+-- Talks to the same service the Creator Store website uses, through your executor's HTTP function.
+-- Roblox blocks HttpService on roblox.com, so this needs request / http_request / syn.request.
+-- If the store can't be reached, "Spawn by asset ID" on the Cars tab still works.
+local Search = {
+	query = "", page = 0, results = {}, seen = {}, busy = false, hasMore = false,
+	status = "Type a car name and press Search.",
+}
+local Saved = { list = {} }
+local spawning = false
+
+local CAR_WORDS = {
+	"car", "cars", "truck", "vehicle", "bus", "van", "suv", "jeep", "taxi", "sedan", "coupe", "supercar",
+	"pickup", "limo", "hatchback", "muscle", "racecar", "ambulance", "tank",
+}
+
+local function httpGet(url)
+	local req = (typeof(request) == "function" and request)
+		or (typeof(http_request) == "function" and http_request)
+		or (typeof(syn) == "table" and syn.request)
+		or (typeof(http) == "table" and http.request)
+		or (typeof(fluxus) == "table" and fluxus.request)
+	if req then
+		local ok, res = pcall(req, { Url = url, Method = "GET", Headers = { ["Accept"] = "application/json" } })
+		if not ok then return nil, tostring(res) end
+		if type(res) ~= "table" then return nil, "bad response" end
+		local code = res.StatusCode or res.status_code or 0
+		if res.Success == false or (type(code) == "number" and code >= 400) then
+			return nil, "HTTP " .. tostring(code)
+		end
+		return res.Body or res.body
+	end
+	local ok, body = pcall(function() return game:HttpGet(url) end)
+	if ok and type(body) == "string" then return body end
+	return nil, "this executor has no HTTP request function"
+end
+
+local function buildQuery(q)
+	if settings.carsOnly then
+		local low = " " .. q:lower() .. " "
+		for _, w in ipairs(CAR_WORDS) do
+			if low:find("%f[%w]" .. w .. "%f[%W]") then return q end
+		end
+		return q .. " car"
+	end
+	return q
+end
+
+function Search.setStatus(text)
+	Search.status = text
+	if UI.setSearchStatus then UI.setSearchStatus(text) end
+end
+
+function Search.run(query, page)
+	if Search.busy then return end
+	query = (query or ""):match("^%s*(.-)%s*$")
+	if query == "" then
+		Search.setStatus("Type something to search for first.")
+		return
+	end
+	page = page or 0
+	Search.busy = true
+	if page == 0 then
+		Search.query = query
+		Search.results = {}
+		Search.seen = {}
+		Search.hasMore = false
+		if UI.renderResults then UI.renderResults() end
+	end
+	Search.setStatus("Searching for '" .. query .. "'...")
+
+	task.spawn(function()
+		local ok, err = pcall(function()
+			local url = string.format("%s/marketplace/%d?limit=%d&pageNumber=%d&keyword=%s",
+				STORE_API, STORE_MODEL_TYPE, STORE_PAGE_SIZE, page, HttpService:UrlEncode(buildQuery(Search.query)))
+			local body, e = httpGet(url)
+			if not body then error(e or "no response", 0) end
+			local data = HttpService:JSONDecode(body)
+			local rows = type(data) == "table" and data.data or nil
+			if type(rows) ~= "table" then error("unexpected reply from the store", 0) end
+
+			local ids = {}
+			for _, row in ipairs(rows) do
+				local id = row.id or row.assetId or (type(row.asset) == "table" and row.asset.id)
+				if id and not Search.seen[id] then
+					Search.seen[id] = true
+					table.insert(ids, id)
+				end
+			end
+			Search.hasMore = #rows >= STORE_PAGE_SIZE
+			Search.page = page
+
+			local info = {}
+			if #ids > 0 then
+				local b2 = httpGet(STORE_API .. "/items/details?assetIds=" .. table.concat(ids, ","))
+				if b2 then
+					local ok2, d2 = pcall(function() return HttpService:JSONDecode(b2) end)
+					if ok2 and type(d2) == "table" and type(d2.data) == "table" then
+						for _, item in ipairs(d2.data) do
+							local a = type(item.asset) == "table" and item.asset or item
+							if a.id then info[a.id] = item end
+						end
+					end
+				end
+			end
+			for _, id in ipairs(ids) do
+				local item = info[id]
+				local a = item and (type(item.asset) == "table" and item.asset or item) or {}
+				local v = item and type(item.voting) == "table" and item.voting or {}
+				local up, down = tonumber(v.upVotes) or 0, tonumber(v.downVotes) or 0
+				table.insert(Search.results, {
+					id = id,
+					name = a.name or ("Model " .. tostring(id)),
+					creator = item and type(item.creator) == "table" and item.creator.name or "unknown",
+					score = (up + down > 0) and (up / (up + down)) or nil,
+					votes = up + down,
+					scripts = a.hasScripts and true or false,
+				})
+			end
+		end)
+		Search.busy = false
+		if ok then
+			if #Search.results == 0 then
+				Search.setStatus("No results for '" .. Search.query .. "'. Try another word.")
+			else
+				Search.setStatus(#Search.results .. " results for '" .. Search.query .. "'")
+			end
+		else
+			local msg = tostring(err)
+			if msg:find("40[13]") then
+				msg = msg .. " (the store refused the request - use Spawn by asset ID instead)"
+			end
+			Search.setStatus("Search failed: " .. msg:sub(1, 140))
+		end
+		if UI.renderResults then UI.renderResults() end
+	end)
+end
+
+function Search.more()
+	if Search.hasMore and not Search.busy then Search.run(Search.query, Search.page + 1) end
+end
+
+--// SAVED CARS (favourites) ---------------------------------------------------
+do
+	local loaded = _G.__MonkeySaved
+	if type(loaded) ~= "table" then
+		loaded = nil
+		pcall(function()
+			if typeof(isfile) == "function" and typeof(readfile) == "function" and isfile(SAVE_FILE) then
+				local d = HttpService:JSONDecode(readfile(SAVE_FILE))
+				if type(d) == "table" then loaded = d end
+			end
+		end)
+	end
+	Saved.list = loaded or {}
+	_G.__MonkeySaved = Saved.list
+end
+
+function Saved.persist()
+	pcall(function()
+		if typeof(writefile) == "function" then
+			writefile(SAVE_FILE, HttpService:JSONEncode(Saved.list))
+		end
+	end)
+end
+
+function Saved.has(id)
+	for _, e in ipairs(Saved.list) do
+		if e.id == id then return true end
+	end
+	return false
+end
+
+function Saved.add(id, name)
+	if Saved.has(id) then return end
+	table.insert(Saved.list, { id = id, name = name or ("Model " .. tostring(id)) })
+	Saved.persist()
+	if UI.renderSaved then UI.renderSaved() end
+end
+
+function Saved.remove(id)
+	for i, e in ipairs(Saved.list) do
+		if e.id == id then
+			table.remove(Saved.list, i)
+			break
+		end
+	end
+	Saved.persist()
+	if UI.renderSaved then UI.renderSaved() end
+end
+
+--// SPAWNING ------------------------------------------------------------------
+local function specFromAsset(id, name)
+	return {
+		name = name or ("Asset " .. tostring(id)), tag = "Creator Store", color = C(200, 200, 210),
+		assetId = tonumber(id), length = settings.importLength, maxSpeed = settings.importSpeed,
+		accel = 1.6, turn = 2.0,
+	}
+end
+
+local function spawnAsync(spec)
+	if spawning then
+		notify("Still loading the last car...")
+		return
+	end
+	spawning = true
+	task.spawn(function()
+		local ok, err = pcall(spawnVehicle, spec)
+		spawning = false
+		if not ok then notify("Spawn failed: " .. tostring(err):sub(1, 70)) end
+	end)
+end
+
+--// USER INTERFACE  (hitbox-expander style) ----------------------------------
+-- wrapped in a function: the main chunk is over Luau's 200-local limit
+local function buildUI()
+	local THEME_NAMES = { "Neon", "Ocean", "Toxic", "Fire", "Mono" }
+	local THEMES = {
+		Neon = {
+			pal = { bg = C(22, 18, 30), card = C(34, 28, 46), cardHi = C(54, 46, 74), field = C(18, 14, 26), line = C(62, 52, 86), accent = C(112, 70, 180), accentText = C(200, 165, 255) },
+			edge = { C(75, 15, 125), C(255, 105, 180), C(235, 25, 45), C(255, 255, 255) },
+		},
+		Ocean = {
+			pal = { bg = C(14, 20, 30), card = C(22, 32, 48), cardHi = C(36, 52, 76), field = C(10, 16, 26), line = C(44, 66, 96), accent = C(40, 120, 200), accentText = C(130, 200, 255) },
+			edge = { C(10, 40, 100), C(0, 190, 255), C(60, 120, 255), C(255, 255, 255) },
+		},
+		Toxic = {
+			pal = { bg = C(14, 24, 18), card = C(22, 38, 28), cardHi = C(34, 60, 42), field = C(10, 18, 13), line = C(46, 80, 56), accent = C(50, 160, 80), accentText = C(150, 255, 170) },
+			edge = { C(10, 70, 30), C(120, 255, 60), C(0, 200, 160), C(255, 255, 255) },
+		},
+		Fire = {
+			pal = { bg = C(30, 18, 16), card = C(46, 28, 24), cardHi = C(74, 44, 36), field = C(24, 14, 12), line = C(92, 56, 44), accent = C(200, 90, 40), accentText = C(255, 190, 120) },
+			edge = { C(110, 10, 10), C(255, 120, 20), C(255, 220, 60), C(255, 255, 255) },
+		},
+		Mono = {
+			pal = { bg = C(22, 22, 22), card = C(34, 34, 34), cardHi = C(54, 54, 54), field = C(16, 16, 16), line = C(70, 70, 70), accent = C(120, 120, 120), accentText = C(220, 220, 220) },
+			edge = { C(40, 40, 40), C(150, 150, 150), C(255, 255, 255), C(90, 90, 90) },
+		},
+	}
+	local P = { text = C(235, 230, 245), sub = C(165, 155, 185), on = C(60, 140, 90), off = C(150, 60, 60), warn = C(235, 90, 90) }
+	local EDGE = THEMES.Neon.edge
+	local EDGE_PERIOD = 14
+	local themed = setmetatable({}, { __mode = "k" })
+
+	local function setPalette(name)
+		local th = THEMES[name] or THEMES.Neon
+		for k, v in pairs(th.pal) do P[k] = v end
+		EDGE = th.edge
+	end
+	setPalette(settings.theme)
+
+	local function recolorAll()
+		for inst, props in pairs(themed) do
+			if inst.Parent then
+				for prop, key in pairs(props) do inst[prop] = P[key] end
+			end
+		end
+	end
+
+	local function edgeColor(t)
+		local n = #EDGE
+		local x = (t / EDGE_PERIOD % 1) * n
+		local i = math.floor(x)
+		local f = x - i
+		f = f * f * (3 - 2 * f)
+		return EDGE[i % n + 1]:Lerp(EDGE[(i + 1) % n + 1], f)
+	end
+
+	local function paint(inst, prop, key)
+		inst[prop] = P[key]
+		local t = themed[inst]
+		if not t then
+			t = {}
+			themed[inst] = t
+		end
+		t[prop] = key
+	end
+
+	local function mk(class, props, parent, paints)
+		local o = Instance.new(class)
+		for k, v in pairs(props) do o[k] = v end
+		if paints then
+			for k, key in pairs(paints) do paint(o, k, key) end
+		end
+		o.Parent = parent
+		return o
+	end
+
+	local function corner(o, r)
+		mk("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o)
+	end
+
+	local function button(parent, text, size, pos, bgKey, textSize)
+		local b = mk("TextButton", {
+			Text = text, Size = size, Position = pos or UDim2.new(), TextColor3 = P.text,
+			Font = Enum.Font.GothamBold, TextSize = textSize or 12, BorderSizePixel = 0,
+		}, parent, { BackgroundColor3 = bgKey or "cardHi" })
+		corner(b, 4)
+		return b
+	end
+
+	local function box(parent, placeholder, size, pos, textSize)
+		local t = mk("TextBox", {
+			Size = size, Position = pos or UDim2.new(), BorderSizePixel = 0, TextColor3 = P.text,
+			PlaceholderText = placeholder, PlaceholderColor3 = P.sub, ClearTextOnFocus = false, Text = "",
+			Font = Enum.Font.GothamBold, TextSize = textSize or 13, TextXAlignment = Enum.TextXAlignment.Left,
+		}, parent, { BackgroundColor3 = "field" })
+		corner(t, 4)
+		mk("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, t)
+		mk("UIStroke", { Thickness = 1 }, t, { Color = "line" })
+		return t
+	end
+
+	--// root + panel -------------------------------------------------------------
+	local sg = Instance.new("ScreenGui")
+	sg.Name = "CarSpawnerUI"
+	sg.ResetOnSpawn = false
+	sg.DisplayOrder = 50
+	sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	local hosted = pcall(function()
+		sg.Parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+	end)
+	if not hosted or not sg.Parent then sg.Parent = playerGui end
+	UI.gui = sg
+
+	local panel = mk("Frame", {
+		Name = "Panel", Size = UDim2.fromOffset(settings.panelW, settings.panelH), Position = UDim2.new(0, 12, 0.25, 0),
+		BorderSizePixel = 0, ClipsDescendants = true,
+	}, sg, { BackgroundColor3 = "bg" })
+	corner(panel, 8)
+	local panelScale = mk("UIScale", { Scale = settings.uiScale }, panel)
+	local panelStroke = mk("UIStroke", { Color = edgeColor(0), Thickness = 2 }, panel)
+
+	local header = mk("Frame", { Size = UDim2.new(1, 0, 0, 36), BorderSizePixel = 0 }, panel, { BackgroundColor3 = "card" })
+	local headerLine = mk("Frame", {
+		Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2), BackgroundColor3 = edgeColor(0), BorderSizePixel = 0,
+	}, header)
+	mk("TextLabel", {
+		Size = UDim2.new(1, -112, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+		Text = "Car Spawner\nmade by DuaKNo & Monkey", Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = P.text,
+		TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
+	}, header)
+	local minBtn = button(header, "-", UDim2.fromOffset(28, 24), UDim2.new(1, -68, 0, 6), "cardHi", 16)
+	local closeBtn = button(header, "x", UDim2.fromOffset(28, 24), UDim2.new(1, -36, 0, 6), "cardHi", 14)
+	local infoBtn = button(header, "!", UDim2.fromOffset(28, 24), UDim2.new(1, -100, 0, 6), "cardHi", 15)
+
+	local mini = button(sg, "CS", UDim2.fromOffset(46, 46), panel.Position, "accent", 15)
+	mini.AutoButtonColor = false
+	mini.Visible = false
+	corner(mini, 8)
+	local miniStroke = mk("UIStroke", { Color = edgeColor(0), Thickness = 2 }, mini)
+
+	local TOP_H = 84
+	local PAGE_Y = 36 + TOP_H
+	local top = mk("Frame", { Position = UDim2.fromOffset(0, 36), Size = UDim2.new(1, 0, 0, TOP_H), BackgroundTransparency = 1 }, panel)
+	local statusLabel = mk("TextLabel", {
+		Position = UDim2.fromOffset(8, 4), Size = UDim2.new(1, -16, 0, 16), BackgroundTransparency = 1, Text = "",
+		Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = P.sub, TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, TextTruncate = Enum.TextTruncate.AtEnd,
+	}, top)
+	local enterBtn = button(top, "Enter nearest car", UDim2.new(0.58, -10, 0, 26), UDim2.fromOffset(8, 24), "on", 12)
+	local removeBtn = button(top, "Remove cars", UDim2.new(0.42, -10, 0, 26), UDim2.new(0.58, 2, 0, 24), "off", 11)
+	local tabRow = mk("Frame", { Position = UDim2.fromOffset(8, 56), Size = UDim2.new(1, -16, 0, 24), BackgroundTransparency = 1 }, top)
+	mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, tabRow)
+
+	--// page builder ---------------------------------------------------------------
+	local pages = {}
+	local function newPage()
+		local pg = mk("ScrollingFrame", {
+			Position = UDim2.fromOffset(0, PAGE_Y), Size = UDim2.new(1, 0, 1, -PAGE_Y), BackgroundTransparency = 1,
+			BorderSizePixel = 0, ScrollBarThickness = 3, CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false,
+		}, panel, { ScrollBarImageColor3 = "accent" })
+		mk("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, pg)
+		mk("UIPadding", {
+			PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 26), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 10),
+		}, pg)
+		table.insert(pages, pg)
+		local B = { page = pg, order = 0, cur = pg }
+		function B.o()
+			B.order += 1
+			return B.order
+		end
+		function B.card(title)
+			local c = mk("Frame", {
+				LayoutOrder = B.o(), Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BorderSizePixel = 0,
+			}, pg, { BackgroundColor3 = "card" })
+			corner(c, 6)
+			mk("UIStroke", { Thickness = 1 }, c, { Color = "line" })
+			mk("UIPadding", {
+				PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+			}, c)
+			mk("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, c)
+			mk("TextLabel", {
+				LayoutOrder = B.o(), Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Text = title,
+				Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+			}, c, { TextColor3 = "accentText" })
+			B.cur = c
+			return c
+		end
+		function B.note(text, color)
+			return mk("TextLabel", {
+				LayoutOrder = B.o(), Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+				Text = text, TextWrapped = true, Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = color or P.sub,
+				TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+			}, B.cur)
+		end
+		function B.box(placeholder, h)
+			local b = box(B.cur, placeholder, UDim2.new(1, 0, 0, h or 30), nil, 12)
+			b.LayoutOrder = B.o()
+			return b
+		end
+		function B.row(h)
+			return mk("Frame", { LayoutOrder = B.o(), Size = UDim2.new(1, 0, 0, h), BackgroundTransparency = 1 }, B.cur)
+		end
+		function B.list()
+			local f = mk("Frame", {
+				LayoutOrder = B.o(), Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+			}, B.cur)
+			mk("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, f)
+			return f
+		end
+		function B.grid(n, cols)
+			cols = cols or 2
+			local rows = math.ceil(n / cols)
+			local g = mk("Frame", {
+				LayoutOrder = B.o(), Size = UDim2.new(1, 0, 0, rows * 28 + (rows - 1) * 4), BackgroundTransparency = 1,
+			}, B.cur)
+			mk("UIGridLayout", {
+				CellSize = cols == 1 and UDim2.new(1, 0, 0, 28) or UDim2.new(0.5, -2, 0, 28),
+				CellPadding = UDim2.fromOffset(4, 4), SortOrder = Enum.SortOrder.LayoutOrder,
+			}, g)
+			return g
+		end
+		function B.cell(grid, textFn, activeFn, onClick)
+			local b = button(grid, "", UDim2.new(), nil, "cardHi", 12)
+			b.LayoutOrder = B.o()
+			b.TextScaled = true
+			mk("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 8 }, b)
+			b.Activated:Connect(function()
+				onClick()
+				UI.refresh()
+			end)
+			table.insert(UI.cells, { b = b, text = textFn, active = activeFn })
+			return b
+		end
+		function B.toggle(grid, label, key, onChange)
+			return B.cell(grid, function() return label .. ": " .. (settings[key] and "ON" or "OFF") end,
+				function() return settings[key] end, function()
+					settings[key] = not settings[key]
+					if onChange then onChange(settings[key]) end
+				end)
+		end
+		function B.cycle(grid, label, key, options, onChange)
+			return B.cell(grid, function() return label .. ": " .. tostring(settings[key]) end, function() return false end, function()
+				local idx = table.find(options, settings[key]) or 0
+				settings[key] = options[idx % #options + 1]
+				if onChange then onChange(settings[key]) end
+			end)
+		end
+		function B.button(text, bgKey, onClick, h)
+			local b = button(B.cur, text, UDim2.new(1, 0, 0, h or 28), nil, bgKey or "cardHi", 12)
+			b.LayoutOrder = B.o()
+			b.Activated:Connect(function()
+				onClick()
+				UI.refresh()
+			end)
+			return b
+		end
+		function B.stepper(label, key, min, max, step, fmt, onChange)
+			local r = B.row(28)
+			local minus = button(r, "-", UDim2.fromOffset(30, 28), UDim2.new(), "cardHi", 16)
+			local plus = button(r, "+", UDim2.fromOffset(30, 28), UDim2.new(1, -30, 0, 0), "cardHi", 16)
+			local lab = mk("TextLabel", {
+				Size = UDim2.new(1, -68, 1, 0), Position = UDim2.fromOffset(34, 0), BorderSizePixel = 0,
+				Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = P.text,
+			}, r, { BackgroundColor3 = "field" })
+			corner(lab, 4)
+			local function refresh()
+				local v = settings[key]
+				lab.Text = label .. ": " .. (fmt and fmt(v) or tostring(v))
+			end
+			local function bump(dir)
+				local v = settings[key] + dir * step
+				v = math.clamp(math.floor(v / step + 0.5) * step, min, max)
+				settings[key] = math.floor(v * 1000 + 0.5) / 1000
+				refresh()
+				if onChange then onChange(settings[key]) end
+			end
+			minus.Activated:Connect(function() bump(-1) end)
+			plus.Activated:Connect(function() bump(1) end)
+			refresh()
+			table.insert(UI.refreshers, refresh)
+		end
+		return B
+	end
+
+	local function plain(v) return tostring(v) end
+	local function times(v) return string.format("%.1fx", v) end
+	local function percent(v) return string.format("%d%%", math.floor(v * 100 + 0.5)) end
+
+	--// CARS PAGE ------------------------------------------------------------------
+	local Cr = newPage()
+	Cr.card("Vehicles")
+	for _, spec in ipairs(VEHICLES) do
+		local b = button(Cr.cur, spec.name .. "  -  " .. spec.tag, UDim2.new(1, 0, 0, 28), nil, "cardHi", 11)
+		b.LayoutOrder = Cr.o()
+		b.TextXAlignment = Enum.TextXAlignment.Left
+		mk("UIPadding", { PaddingLeft = UDim.new(0, 32) }, b)
+		local sw = mk("Frame", { Position = UDim2.new(0, -26, 0.5, -8), Size = UDim2.fromOffset(16, 16), BackgroundColor3 = spec.color, BorderSizePixel = 0 }, b)
+		corner(sw, 4)
+		mk("UIStroke", { Color = C(255, 255, 255), Thickness = 1, Transparency = 0.6 }, sw)
+		b.Activated:Connect(function() spawnAsync(spec) end)
+	end
+
+	Cr.card("Saved cars")
+	local savedList = Cr.list()
+	Cr.note("Tap Save on a search result to keep a car here. Saved cars survive re-runs" .. (typeof(writefile) == "function" and " and restarts." or "."))
+
+	Cr.card("Actions")
+	local gC = Cr.grid(4)
+	Cr.cell(gC, function() return "Enter nearest" end, function() return false end, function()
+		local car = nearestCar(250)
+		if car then enterCar(car) else notify("No free car nearby") end
+	end)
+	Cr.cell(gC, function() return "Flip upright (V)" end, function() return false end, function() flipCar() end)
+	Cr.cell(gC, function() return "Fix: faces backwards" end, function() return false end, function()
+		local car = drivenCar or cars[#cars]
+		if not (car and car.spec.assetId) then
+			notify("Only works on the model cars")
+			return
+		end
+		local spec = car.spec
+		_G.__MonkeyFlips[spec.assetId] = not _G.__MonkeyFlips[spec.assetId]
+		removeCar(car)
+		spawnAsync(spec)
+	end)
+	Cr.cell(gC, function() return "Remove all cars" end, function() return false end, removeAllCars)
+
+	Cr.card("Spawn by asset ID")
+	local idBox = Cr.box("paste a model id  (e.g. 6810376207)", 30)
+	Cr.button("Spawn this asset", "accent", function()
+		local id = tonumber((idBox.Text:gsub("%D", "")))
+		if not id then
+			notify("Type a numeric asset id first")
+			return
+		end
+		spawnAsync(specFromAsset(id, "Asset " .. id))
+	end)
+
+	--// SEARCH PAGE ----------------------------------------------------------------
+	local Se = newPage()
+	Se.card("Creator Store search")
+	local searchBox = Se.box("search cars  (police car, bmw m3, truck...)", 30)
+	local gS = Se.grid(2)
+	Se.cell(gS, function() return Search.busy and "Searching..." or "Search" end, function() return Search.busy end, function()
+		Search.run(searchBox.Text, 0)
+	end)
+	Se.cell(gS, function() return "Sort: " .. settings.searchSort end, function() return false end, function()
+		settings.searchSort = settings.searchSort == "Relevance" and "Likes" or "Relevance"
+		UI.renderResults()
+	end)
+	local gS2 = Se.grid(1, 1)
+	Se.toggle(gS2, "Cars only (adds 'car' to the search)", "carsOnly")
+	local QUICK = {
+		{ { "Sports", "sports car" }, { "Police", "police car" }, { "Truck", "truck" }, { "Drift", "drift car" } },
+		{ { "Taxi", "taxi" }, { "Bus", "bus" }, { "Offroad", "offroad suv" }, { "Classic", "classic car" } },
+	}
+	for _, rowDef in ipairs(QUICK) do
+		local chipRow = Se.row(24)
+		mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, chipRow)
+		for i, q in ipairs(rowDef) do
+			local chip = button(chipRow, q[1], UDim2.new(1 / #rowDef, -3, 1, 0), nil, "cardHi", 11)
+			chip.LayoutOrder = i
+			chip.Activated:Connect(function()
+				searchBox.Text = q[2]
+				Search.run(q[2], 0)
+			end)
+		end
+	end
+	local searchStatus = Se.note(Search.status, P.text)
+	searchBox.FocusLost:Connect(function(enter)
+		if enter then Search.run(searchBox.Text, 0) end
+	end)
+
+	Se.card("Results")
+	local resultsList = Se.list()
+
+	--// NPC PAGE -------------------------------------------------------------------
+	local Np = newPage()
+	Np.card("Spawn")
+	local gN = Np.grid(4)
+	Np.cell(gN, function() return "Spawn NPC" end, function() return false end, function() task.spawn(spawnNpcs, 1) end)
+	Np.cell(gN, function() return "Spawn 5 NPCs" end, function() return false end, function() task.spawn(spawnNpcs, 5) end)
+	Np.cell(gN, function() return "Clear NPCs" end, function() return false end, clearNpcs)
+	Np.cell(gN, function() return "Spawn 10 NPCs" end, function() return false end, function() task.spawn(spawnNpcs, 10) end)
+	Np.card("Behaviour")
+	local gN2 = Np.grid(2)
+	Np.toggle(gN2, "Respawn dead", "npcRespawn")
+	Np.toggle(gN2, "Map NPCs", "adoptNpcs")
+	Np.stepper("Max NPCs", "maxNpcs", 5, 60, 5, plain)
+	Np.stepper("Map NPC limit", "adoptMax", 5, 60, 5, plain)
+	Np.note("NPCs only talk. Map NPCs (the ones already in the game) are ragdolled and killed for real through network ownership, so other players see the ragdoll too. NPCs from the Spawn buttons are local copies only you can see.")
+	Np.note("More NPCs = more lag. Each NPC's logic runs 15 times a second (10 in low lag mode) instead of every frame.")
+
+	--// SETTINGS PAGE --------------------------------------------------------------
+	local St = newPage()
+	St.card("Driving")
+	local gD = St.grid(4)
+	St.toggle(gD, "Auto-enter", "autoEnter")
+	St.toggle(gD, "Auto lights", "autoLights")
+	St.toggle(gD, "Chase cam (C)", "chaseCam")
+	St.toggle(gD, "Speed FOV", "fovEffect")
+	St.stepper("Top speed", "speedMult", 0.5, 2.5, 0.1, times)
+	St.stepper("Drift grip", "grip", 0.3, 2, 0.1, times)
+	St.stepper("Max vehicles", "maxVehicles", 1, 6, 1, plain)
+	local gU = St.grid(1, 1)
+	St.cycle(gU, "Speed units", "units", { "km/h", "mph" })
+
+	St.card("Effects")
+	local gE = St.grid(4)
+	St.toggle(gE, "Smoke", "smoke")
+	St.toggle(gE, "Skid marks", "skidMarks")
+	St.toggle(gE, "Underglow", "underglow")
+	St.toggle(gE, "Sounds", "sounds")
+	St.stepper("Volume", "volume", 0, 1, 0.05, percent)
+
+	St.card("Performance")
+	local gP = St.grid(1, 1)
+	St.toggle(gP, "Low lag mode", "lowLag")
+	St.note("Low lag mode turns off smoke and skid marks and slows NPC AI. Parked cars already sleep on their own, and imported models are stripped of particles, lights and tiny shadows.")
+
+	St.card("Network ownership")
+	St.stepper("Simulation radius", "simRadius", 250, 10000, 250, function(v) return v .. " studs" end, function() Net.apply() end)
+	St.note("A bigger simulation radius gives you network ownership of NPCs from further away, so car hits on map NPCs ragdoll for everyone from further away. It is reapplied every second and restored when you unload. Needs an executor with sethiddenproperty.")
+
+	St.card("Creator Store cars")
+	St.stepper("Car length", "importLength", 12, 40, 1, function(v) return v .. " studs" end)
+	St.stepper("Top speed", "importSpeed", 60, 220, 10, plain)
+	St.note("Applies to cars spawned from Search or by asset ID. Models with more than " .. MAX_CAR_PARTS .. " parts are refused because they lag.")
+
+	St.card("Interface")
+	local gI = St.grid(2)
+	St.toggle(gI, "Speedometer", "showHud")
+	St.cycle(gI, "Theme", "theme", THEME_NAMES, function(name)
+		setPalette(name)
+		recolorAll()
+	end)
+	St.stepper("Menu size", "uiScale", 0.5, 1.3, 0.05, percent, function(v) panelScale.Scale = v end)
+	St.button("Reset all settings", "off", function()
+		for k, v in pairs(DEFAULTS) do settings[k] = v end
+		settings.paint = nil
+		Net.apply()
+		setPalette(settings.theme)
+		recolorAll()
+		panelScale.Scale = settings.uiScale
+		panel.Size = UDim2.fromOffset(settings.panelW, settings.panelH)
+		notify("Settings reset")
+	end)
+
+	--// tabs -----------------------------------------------------------------------
+	local tabNames = { "Cars", "Search", "NPCs", "Settings" }
+	local tabBtns = {}
+	local function showTab(i)
+		UI.tab = i
+		for k, pg in ipairs(pages) do pg.Visible = k == i end
+		for k, b in ipairs(tabBtns) do b.BackgroundColor3 = k == i and P.accent or P.cardHi end
+	end
+	for i, nm in ipairs(tabNames) do
+		local b = button(tabRow, nm, UDim2.new(1 / #tabNames, -3, 1, 0), nil, "cardHi", 11)
+		b.LayoutOrder = i
+		b.TextScaled = true
+		mk("UITextSizeConstraint", { MaxTextSize = 11, MinTextSize = 7 }, b)
+		tabBtns[i] = b
+		b.Activated:Connect(function()
+			showTab(i)
+			UI.refresh()
+		end)
+	end
+
+	--// info page ("!") ----------------------------------------------------------------
+	local info = mk("ScrollingFrame", {
+		Position = UDim2.fromOffset(0, 36), Size = UDim2.new(1, 0, 1, -36), BorderSizePixel = 0, ScrollBarThickness = 3,
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false, ZIndex = 5,
+	}, panel, { BackgroundColor3 = "bg", ScrollBarImageColor3 = "accent" })
+	mk("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 20), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 12) }, info)
+	mk("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, ZIndex = 6,
+		TextWrapped = true, RichText = true, Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = P.sub,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		Text = table.concat({
+			"<b>DRIVING</b>",
+			"W / S or Up / Down   throttle, brake, reverse",
+			"A / D or Left / Right   steer",
+			"Space handbrake (drift)   |   Shift nitro",
+			"F exit   |   E enter a nearby car",
+			"L lights   H horn   G siren / underglow",
+			"Q / E signals   Z hazards",
+			"V flip upright   C chase camera",
+			"Hold a mouse button (or drag) to look around",
+			"",
+			"<b>MENU</b>",
+			"M opens or closes the menu.",
+			"Drag the title bar to move it, drag the corner grip to resize it.",
+			"'-' shrinks it to the CS bubble, 'x' unloads Car Spawner.",
+			"",
+			"<b>NPCS</b>",
+			"NPCs only talk. Car hits ragdoll and kill map NPCs for real (other players see it) using network ownership.",
+			"Settings > Network ownership: raise the simulation radius to own NPCs from further away.",
+			"",
+			"<b>CAR SEARCH</b>",
+			"Search tab: type a car name, press Search (or Enter). Spawn drops the car in front of you.",
+			"Save keeps it in Cars > Saved cars.",
+			"If search says it was refused, copy a model's id from the Creator Store and use Cars > Spawn by asset ID.",
+			"Scripts inside searched models are always removed before the car is spawned.",
+		}, "\n"),
+	}, info)
+
+	--// toast ----------------------------------------------------------------------
+	local toast = mk("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 60), Size = UDim2.fromOffset(300, 30),
+		BorderSizePixel = 0, Visible = false, ZIndex = 30,
+	}, sg, { BackgroundColor3 = "card" })
+	corner(toast, 8)
+	mk("UIStroke", { Thickness = 2 }, toast, { Color = "accent" })
+	local toastLabel = mk("TextLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", TextColor3 = P.text,
+		Font = Enum.Font.GothamBold, TextSize = 12, TextWrapped = true, ZIndex = 31,
+	}, toast)
+	local toastToken = 0
+	local statusMsg, statusUntil = nil, 0
+	UI.notify = function(text)
+		toastToken += 1
+		local my = toastToken
+		toastLabel.Text = text
+		toast.Size = UDim2.fromOffset(math.clamp(#text * 7 + 30, 170, 460), 30)
+		toast.Visible = true
+		statusMsg, statusUntil = text, os.clock() + 3.5
+		task.delay(2.6, function()
+			if my == toastToken then toast.Visible = false end
+		end)
+	end
+
+	--// status line (FPS + what's happening) -----------------------------------------
+	local statusAcc = 1
+	UI.updateStatus = function(dt)
+		statusAcc += dt
+		if statusAcc < 0.35 or not panel.Visible then return end
+		statusAcc = 0
+		local text
+		if statusMsg and os.clock() < statusUntil then
+			text = statusMsg
+		else
+			local fps = math.floor(1 / math.max(perf.dt, 1 / 240) + 0.5)
+			local drive = drivenCar and ("Driving: " .. drivenCar.spec.name) or "On foot"
+			text = string.format("%d FPS  |  %s  |  %d cars  %d NPCs", fps, drive, #cars, #npcs)
+		end
+		if statusLabel.Text ~= text then statusLabel.Text = text end
+	end
+
+	--// dynamic lists: search results + saved cars ----------------------------------------
+	local function clearChildren(frame)
+		for _, c in ipairs(frame:GetChildren()) do
+			if c:IsA("GuiObject") then c:Destroy() end
+		end
+	end
+
+	local resultToken = 0
+	local function resultRow(i, it)
+		local row = mk("Frame", { LayoutOrder = i, Size = UDim2.new(1, 0, 0, 62), BorderSizePixel = 0 }, resultsList, { BackgroundColor3 = "field" })
+		corner(row, 5)
+		mk("UIStroke", { Thickness = 1 }, row, { Color = "line" })
+		local thumb = mk("ImageLabel", {
+			Position = UDim2.fromOffset(5, 5), Size = UDim2.fromOffset(52, 52), BorderSizePixel = 0, ScaleType = Enum.ScaleType.Fit,
+			Image = "rbxthumb://type=Asset&id=" .. tostring(it.id) .. "&w=150&h=150",
+		}, row, { BackgroundColor3 = "card" })
+		corner(thumb, 4)
+		mk("TextLabel", {
+			Position = UDim2.fromOffset(64, 5), Size = UDim2.new(1, -128, 0, 16), BackgroundTransparency = 1, Text = it.name,
+			Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = P.text, TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		}, row)
+		mk("TextLabel", {
+			Position = UDim2.fromOffset(64, 23), Size = UDim2.new(1, -128, 0, 14), BackgroundTransparency = 1, Text = "by " .. it.creator,
+			Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = P.sub, TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		}, row)
+		local votes = it.score and string.format("%d%% liked", math.floor(it.score * 100 + 0.5)) or "no votes"
+		local meta = votes .. "  |  id " .. tostring(it.id) .. (it.scripts and "  |  scripts" or "")
+		mk("TextLabel", {
+			Position = UDim2.fromOffset(64, 39), Size = UDim2.new(1, -128, 0, 14), BackgroundTransparency = 1, Text = meta,
+			Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = P.sub, TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		}, row)
+		local spawnBtn = button(row, "Spawn", UDim2.fromOffset(54, 22), UDim2.new(1, -60, 0, 6), "accent", 11)
+		spawnBtn.Activated:Connect(function() spawnAsync(specFromAsset(it.id, it.name)) end)
+		local saveBtn = button(row, Saved.has(it.id) and "Saved" or "Save", UDim2.fromOffset(54, 22), UDim2.new(1, -60, 0, 34), "cardHi", 11)
+		saveBtn.Activated:Connect(function()
+			if Saved.has(it.id) then
+				Saved.remove(it.id)
+				saveBtn.Text = "Save"
+			else
+				Saved.add(it.id, it.name)
+				saveBtn.Text = "Saved"
+			end
+		end)
+	end
+
+	UI.renderResults = function()
+		resultToken += 1
+		local my = resultToken
+		clearChildren(resultsList)
+		local list = table.clone(Search.results)
+		if settings.searchSort == "Likes" then
+			table.sort(list, function(a, b)
+				local sa, sb = a.score or -1, b.score or -1
+				if sa == sb then return a.votes > b.votes end
+				return sa > sb
+			end)
+		end
+		task.spawn(function()
+			for i, it in ipairs(list) do
+				if my ~= resultToken then return end
+				resultRow(i, it)
+				if i % 8 == 0 then task.wait() end
+			end
+			if my == resultToken and Search.hasMore then
+				local more = button(resultsList, "Load more results", UDim2.new(1, 0, 0, 28), nil, "cardHi", 12)
+				more.LayoutOrder = #list + 1
+				more.Activated:Connect(function() Search.more() end)
+			end
+		end)
+		UI.refresh()
+	end
+
+	UI.renderSaved = function()
+		clearChildren(savedList)
+		if #Saved.list == 0 then
+			mk("TextLabel", {
+				LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, Text = "Nothing saved yet.",
+				Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = P.sub, TextXAlignment = Enum.TextXAlignment.Left,
+			}, savedList)
+			return
+		end
+		for i, e in ipairs(Saved.list) do
+			local row = mk("Frame", { LayoutOrder = i, Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1 }, savedList)
+			local go = button(row, e.name, UDim2.new(1, -32, 1, 0), nil, "cardHi", 11)
+			go.TextXAlignment = Enum.TextXAlignment.Left
+			go.TextTruncate = Enum.TextTruncate.AtEnd
+			mk("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 6) }, go)
+			go.Activated:Connect(function() spawnAsync(specFromAsset(e.id, e.name)) end)
+			local del = button(row, "x", UDim2.fromOffset(28, 28), UDim2.new(1, -28, 0, 0), "off", 12)
+			del.Activated:Connect(function() Saved.remove(e.id) end)
+		end
+	end
+
+	UI.setSearchStatus = function(text)
+		searchStatus.Text = text
+		UI.refresh()
+	end
+
+	--// refresh (button labels, steppers, active colours) ------------------------------------
+	UI.refresh = function()
+		for _, c in ipairs(UI.cells) do
+			if c.b.Parent then
+				c.b.Text = c.text()
+				c.b.BackgroundColor3 = c.active() and P.accent or P.cardHi
+			end
+		end
+		for _, fn in ipairs(UI.refreshers) do fn() end
+		for k, b in ipairs(tabBtns) do b.BackgroundColor3 = k == UI.tab and P.accent or P.cardHi end
+	end
+
+	--// drag, minimize, resize -------------------------------------------------------------
+	local function makeDraggable(handle, target, onTap)
+		local dragging, dragInput, dragStart, startPos, moved = false, nil, nil, nil, false
+		track(handle.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+				dragging, dragInput, moved = true, i, false
+				dragStart = i.Position
+				startPos = target.Position
+				i.Changed:Connect(function()
+					if i.UserInputState == Enum.UserInputState.End then
+						local was = dragging
+						dragging = false
+						if was and not moved and onTap then onTap() end
+					end
+				end)
+			end
+		end))
+		track(UserInputService.InputChanged:Connect(function(i)
+			if not dragging then return end
+			local isTouch = dragInput.UserInputType == Enum.UserInputType.Touch
+			if (isTouch and i == dragInput) or (not isTouch and i.UserInputType == Enum.UserInputType.MouseMovement) then
+				local d = i.Position - dragStart
+				if d.Magnitude > 6 then moved = true end
+				target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+			end
+		end))
+	end
+
+	local function setMinimized(v)
+		panel.Visible = not v
+		mini.Visible = v
+		if v then mini.Position = panel.Position else panel.Position = mini.Position end
+	end
+	UI.togglePanel = function() setMinimized(panel.Visible) end
+	UI.setPanel = function(open) setMinimized(not open) end
+
+	minBtn.Activated:Connect(function() setMinimized(true) end)
+	infoBtn.Activated:Connect(function() info.Visible = not info.Visible end)
+	closeBtn.Activated:Connect(function()
+		if _G.__MonkeyVehicleStop then _G.__MonkeyVehicleStop() end
+	end)
+	enterBtn.Activated:Connect(function()
+		local car = nearestCar(250)
+		if car then enterCar(car) else notify("No free car nearby") end
+	end)
+	removeBtn.Activated:Connect(removeAllCars)
+	makeDraggable(header, panel, nil)
+	makeDraggable(mini, mini, function() setMinimized(false) end)
+
+	local grip = mk("TextButton", {
+		Name = "Resize", Text = "", AutoButtonColor = false, Size = UDim2.fromOffset(20, 20), Position = UDim2.new(1, -20, 1, -20),
+		BackgroundTransparency = 0.25, BorderSizePixel = 0, ZIndex = 10,
+	}, panel, { BackgroundColor3 = "card" })
+	corner(grip, 3)
+	for _, p in ipairs({ { 12, 12 }, { 6, 12 }, { 12, 6 } }) do
+		mk("Frame", { Size = UDim2.fromOffset(3, 3), Position = UDim2.fromOffset(p[1], p[2]), BorderSizePixel = 0, ZIndex = 11 }, grip, { BackgroundColor3 = "sub" })
+	end
+	local resizing, rInput, rStart, rW, rH = false, nil, nil, 0, 0
+	track(grip.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			resizing, rInput, rStart, rW, rH = true, i, i.Position, settings.panelW, settings.panelH
+			i.Changed:Connect(function()
+				if i.UserInputState == Enum.UserInputState.End then resizing = false end
+			end)
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(i)
+		if not resizing then return end
+		local isTouch = rInput.UserInputType == Enum.UserInputType.Touch
+		if (isTouch and i == rInput) or (not isTouch and i.UserInputType == Enum.UserInputType.MouseMovement) then
+			local d = (i.Position - rStart) / math.max(panelScale.Scale, 0.1)
+			settings.panelW = math.clamp(math.floor(rW + d.X), 240, 480)
+			settings.panelH = math.clamp(math.floor(rH + d.Y), 260, 700)
+			panel.Size = UDim2.fromOffset(settings.panelW, settings.panelH)
+		end
+	end))
+
+	local edgeAcc = 0
+	track(RunService.Heartbeat:Connect(function(dt)
+		if not (panel.Visible or mini.Visible) then return end
+		edgeAcc += dt
+		if edgeAcc < 1 / 30 then return end
+		edgeAcc = 0
+		local col = edgeColor(os.clock())
+		panelStroke.Color = col
+		miniStroke.Color = col
+		headerLine.BackgroundColor3 = col
+	end))
+
+	--// speedometer HUD ----------------------------------------------------------------------
+	local hud = mk("Frame", {
+		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -22), Size = UDim2.fromOffset(250, 96),
+		BackgroundTransparency = 0.1, BorderSizePixel = 0, Visible = false,
+	}, sg, { BackgroundColor3 = "bg" })
+	corner(hud, 8)
+	mk("UIScale", { Scale = 0.78 }, hud)
+	mk("UIStroke", { Thickness = 2 }, hud, { Color = "accent" })
+	local nameLabel = mk("TextLabel", {
+		Position = UDim2.fromOffset(12, 4), Size = UDim2.new(1, -24, 0, 16), BackgroundTransparency = 1, Text = "",
+		TextColor3 = P.sub, Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+	}, hud)
+	local speedLabel = mk("TextLabel", {
+		Position = UDim2.fromOffset(60, 16), Size = UDim2.fromOffset(110, 44), BackgroundTransparency = 1, Text = "0",
+		Font = Enum.Font.GothamBlack, TextSize = 38,
+	}, hud, { TextColor3 = "accentText" })
+	local unitLabel = mk("TextLabel", {
+		Position = UDim2.fromOffset(60, 56), Size = UDim2.fromOffset(110, 14), BackgroundTransparency = 1, Text = "KM/H",
+		TextColor3 = P.sub, Font = Enum.Font.GothamBold, TextSize = 11,
+	}, hud)
+	local gearLabel = mk("TextLabel", {
+		Position = UDim2.fromOffset(14, 20), Size = UDim2.fromOffset(40, 44), BackgroundTransparency = 1, Text = "N",
+		TextColor3 = P.text, Font = Enum.Font.GothamBlack, TextSize = 30,
+	}, hud)
+	local rpmBack = mk("Frame", { Position = UDim2.fromOffset(12, 74), Size = UDim2.new(1, -24, 0, 6), BorderSizePixel = 0 }, hud, { BackgroundColor3 = "cardHi" })
+	corner(rpmBack, 3)
+	local rpmFill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = P.accent, BorderSizePixel = 0 }, rpmBack)
+	corner(rpmFill, 3)
+	local nitroBack = mk("Frame", { Position = UDim2.fromOffset(12, 84), Size = UDim2.new(1, -24, 0, 5), BorderSizePixel = 0 }, hud, { BackgroundColor3 = "cardHi" })
+	corner(nitroBack, 3)
+	local nitroFill = mk("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = C(70, 160, 255), BorderSizePixel = 0 }, nitroBack)
+	corner(nitroFill, 3)
+	local flagsLabel = mk("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 22), Size = UDim2.fromOffset(60, 40),
+		BackgroundTransparency = 1, Text = "", TextColor3 = P.sub, Font = Enum.Font.GothamBold, TextSize = 11,
+	}, hud)
+
+	--// on-screen driving buttons --------------------------------------------------------------
+	local controls = mk("Frame", {
+		AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -22), Size = UDim2.fromOffset(150, 150),
+		BackgroundTransparency = 1, Visible = false,
+	}, sg)
+	mk("UIScale", { Scale = 0.82 }, controls)
+	local function ctl(text, pos, color, size, paintKey)
+		local b = mk("TextButton", {
+			Position = pos, Size = UDim2.fromOffset(size or 66, size or 66), BackgroundTransparency = 0.15, Text = text,
+			TextColor3 = P.text, Font = Enum.Font.GothamBlack, TextSize = 13, BorderSizePixel = 0, AutoButtonColor = false,
+		}, controls, paintKey and { BackgroundColor3 = paintKey } or nil)
+		if not paintKey then b.BackgroundColor3 = color end
+		corner(b, 33)
+		return b
+	end
+	local exitBtn = ctl("EXIT", UDim2.fromOffset(84, 84), C(150, 40, 40))
+	exitBtn.Activated:Connect(function()
+		if drivenCar then exitCar(drivenCar) end
+	end)
+	local nitroBtn = ctl("NITRO", UDim2.fromOffset(84, 10), C(40, 110, 200), 62)
+	local brakeBtn = ctl("BRAKE", UDim2.fromOffset(10, 84), C(200, 120, 30), 62)
+	local hornBtn = ctl("HORN", UDim2.fromOffset(10, 10), nil, 62, "cardHi")
+	for _, b in ipairs({ nitroBtn, brakeBtn, hornBtn }) do b.Visible = UserInputService.TouchEnabled end
+	nitroBtn.MouseButton1Down:Connect(function() touch.nitro = true end)
+	nitroBtn.MouseButton1Up:Connect(function() touch.nitro = false end)
+	nitroBtn.MouseLeave:Connect(function() touch.nitro = false end)
+	brakeBtn.MouseButton1Down:Connect(function() touch.brake = true end)
+	brakeBtn.MouseButton1Up:Connect(function() touch.brake = false end)
+	brakeBtn.MouseLeave:Connect(function() touch.brake = false end)
+	hornBtn.Activated:Connect(function()
+		if drivenCar then playSound(SOUNDS.horn, drivenCar.chassis) end
+	end)
+
+	local lastValue = setmetatable({}, { __mode = "k" })
+	local function setProp(obj, prop, value)
+		local t = lastValue[obj]
+		if not t then
+			t = {}
+			lastValue[obj] = t
+		end
+		if t[prop] ~= value then
+			t[prop] = value
+			obj[prop] = value
+		end
+	end
+	local hudShown, controlsShown = false, false
+	UI.updateHud = function(car)
+		if not car then
+			if hudShown then hud.Visible, hudShown = false, false end
+			if controlsShown then controls.Visible, controlsShown = false, false end
+			return
+		end
+		if not controlsShown then controls.Visible, controlsShown = true, true end
+		local want = settings.showHud and true or false
+		if hudShown ~= want then hud.Visible, hudShown = want, want end
+		if not want then return end
+		local mult = settings.units == "mph" and 0.621 or 1
+		setProp(speedLabel, "Text", tostring(math.floor(math.abs(car.speed) * mult + 0.5)))
+		setProp(unitLabel, "Text", settings.units == "mph" and "MPH" or "KM/H")
+		setProp(nameLabel, "Text", car.spec.name .. "  -  " .. car.spec.tag)
+		local maxSpd = car.spec.maxSpeed * settings.speedMult
+		local ratio = math.clamp(math.abs(car.speed) / maxSpd, 0, 1.45)
+		local gear = math.clamp(math.ceil(ratio * 6 - 0.001), 1, 6)
+		local gearText
+		if car.speed < -1 then
+			gearText = "R"
+		elseif math.abs(car.speed) < 1 then
+			gearText = "N"
+		else
+			gearText = tostring(gear)
+		end
+		setProp(gearLabel, "Text", gearText)
+		local band = (ratio * 6) % 1
+		if ratio >= 1 then band = 1 end
+		setProp(rpmFill, "BackgroundColor3", band > 0.85 and C(255, 70, 50) or P.accent)
+		setProp(rpmFill, "Size", UDim2.new(math.floor(math.clamp(0.25 + band * 0.75, 0, 1) * 50) / 50, 0, 1, 0))
+		setProp(nitroFill, "Size", UDim2.new(math.floor(math.clamp(car.nitro / 100, 0, 1) * 50) / 50, 0, 1, 0))
+		local flags = ""
+		if car.lightsOn then flags = "LIGHTS" end
+		if car.siren and car.siren.on then flags = flags .. (flags ~= "" and "\n" or "") .. "SIREN" end
+		if car.signal ~= 0 then
+			flags = flags .. (flags ~= "" and "\n" or "") .. (car.signal == 2 and "HAZARD" or (car.signal < 0 and "<<" or ">>"))
+		end
+		setProp(flagsLabel, "Text", flags)
+	end
+
+	--// start ----------------------------------------------------------------------------------
+	showTab(1)
+	UI.renderSaved()
+	UI.refresh()
+end
+buildUI()
+
+--// INPUT --------------------------------------------------------------------
+track(UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	local kc = input.KeyCode
+
+	if kc == Enum.KeyCode.M then
+		UI.togglePanel()
+		return
+	elseif kc == Enum.KeyCode.V then
+		flipCar()
+		return
+	elseif kc == Enum.KeyCode.C then
+		settings.chaseCam = not settings.chaseCam
+		UI.refresh()
+		notify(settings.chaseCam and "Chase camera on" or "Chase camera off")
+		return
+	end
+
+	local car = drivenCar
+	if not car then return end
+	if kc == Enum.KeyCode.F or kc == Enum.KeyCode.ButtonB then
+		exitCar(car)
+	elseif kc == Enum.KeyCode.L then
+		car.lightsManual = not car.lightsOn
+	elseif kc == Enum.KeyCode.H then
+		playSound(SOUNDS.horn, car.chassis)
+	elseif kc == Enum.KeyCode.G then
+		if car.siren then
+			setSiren(car, not car.siren.on)
+			notify(car.siren.on and "Siren on" or "Siren off")
+		elseif car.glow then
+			local cur = car.glow.on
+			car.glowManual = not cur
+			notify(car.glowManual and "Underglow on" or "Underglow off")
+		else
+			notify("This car has no siren or underglow")
+		end
+	elseif kc == Enum.KeyCode.Q then
+		car.signal = (car.signal == -1) and 0 or -1
+	elseif kc == Enum.KeyCode.E then
+		car.signal = (car.signal == 1) and 0 or 1
+	elseif kc == Enum.KeyCode.Z then
+		car.signal = (car.signal == 2) and 0 or 2
+	end
+end))
+
+track(UserInputService.InputChanged:Connect(function(input, processed)
+	if drivenCar and not processed and input.UserInputType == Enum.UserInputType.Touch then
+		camState.yaw -= input.Delta.X * 0.009
+		camState.pitch = math.clamp(camState.pitch + input.Delta.Y * 0.006, -0.4, 0.9)
+		camState.lastLook = os.clock()
+		return
+	end
+	if drivenCar and input.KeyCode == Enum.KeyCode.Thumbstick2 then
+		camState.yaw -= input.Position.X * 0.05
+		camState.pitch = math.clamp(camState.pitch - input.Position.Y * 0.03, -0.4, 0.9)
+		camState.lastLook = os.clock()
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseMovement and drivenCar
+		and (UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+			or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)) then
+		camState.yaw -= input.Delta.X * 0.006
+		camState.pitch = math.clamp(camState.pitch + input.Delta.Y * 0.004, -0.4, 0.9)
+		camState.lastLook = os.clock()
+	end
+end))
+
+local function onCharacter(char)
+	if drivenCar then exitCar(drivenCar, true) end
+end
+track(player.CharacterAdded:Connect(onCharacter))
+
+--// MAIN LOOP ----------------------------------------------------------------
+RunService:BindToRenderStep("MonkeyCamera", Enum.RenderPriority.Camera.Value + 1, updateCamera)
+
+local lastChar = nil
+local hudAcc = 0
+local adoptAcc = 0
+
+track(RunService.Heartbeat:Connect(function(dt)
+	perf.dt = perf.dt * 0.95 + dt * 0.05
+	dt = math.min(dt, 0.1)
+	local now = os.clock()
+	local char, hum, root = getCharacter()
+	playerRoot = root
+
+	if char ~= lastChar then
+		lastChar = char
+		rayParams.FilterDescendantsInstances = char and { world, char } or { world }
+	end
+
+	if drivenCar then
+		local d = drivenCar.driver
+		if not char or not d or d.char ~= char then
+			exitCar(drivenCar, true)
+		elseif now - drivenCar.enteredAt < 0.6 then
+			if not hum.Sit then hum.Sit = true end
+		elseif not hum.Sit then
+			exitCar(drivenCar)
+		end
+	end
+
+	for i = #cars, 1, -1 do
+		local car = cars[i]
+		if not car.model.Parent then
+			if car.driver then exitCar(car, true) end
+			table.remove(cars, i)
+		elseif car.chassis.Position.Y < -250 then
+			removeCar(car)
+			notify("A vehicle fell out of the world")
+		elseif not car.parked then
+			stepCar(car, dt, now, hum)
+		end
+	end
+
+	if drivenCar and drivenCar.driver and root and drivenCar.chassis.Parent then
+		local ch = drivenCar.chassis
+		root.CFrame = ch.CFrame * drivenCar.seatOffset
+		root.AssemblyLinearVelocity = ch.AssemblyLinearVelocity
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	local npcStep = settings.lowLag and NPC_STEP_LOW or NPC_STEP
+	for i = #npcs, 1, -1 do
+		local npc = npcs[i]
+		npc.acc = (npc.acc or math.random() * npcStep) + dt
+		if npc.acc >= npcStep then
+			local ndt = npc.acc
+			npc.acc = 0
+			local ok, alive = pcall(stepNpc, npc, ndt, now)
+			if not ok or not alive then
+				local wasDead = npc.dead
+				table.remove(npcs, i)
+				if npc.real then
+					Adopt.hidden[npc.model] = nil
+				else
+					if npc.model then npc.model:Destroy() end
+					if wasDead and settings.npcRespawn then
+						task.delay(2.5, function()
+							if spawnedCount() < settings.maxNpcs then spawnOneNpc() end
+						end)
+					end
+				end
+			end
+		end
+	end
+
+	adoptAcc += dt
+	if adoptAcc >= 1 then
+		adoptAcc = 0
+		pcall(Adopt.tick, now, root)
+	end
+
+	hudAcc += dt
+	if hudAcc >= HUD_STEP then
+		hudAcc = 0
+		UI.updateHud(drivenCar)
+	end
+	UI.updateStatus(dt)
+end))
+
+_G.__MonkeyVehicleStop = function()
+	if drivenCar then pcall(exitCar, drivenCar, true) end
+	pcall(function() RunService:UnbindFromRenderStep("MonkeyCamera") end)
+	pcall(function() ContextActionService:UnbindAction("MonkeyDriveSink") end)
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	local cam = Workspace.CurrentCamera
+	if cam then
+		pcall(function()
+			cam.FieldOfView = camState.baseFov
+			if camState.scripted then cam.CameraType = Enum.CameraType.Custom end
+		end)
+	end
+	for _, n in ipairs(npcs) do
+		if n.real and n.ragdolled and not n.dead then pcall(recoverNpc, n) end
+	end
+	pcall(Net.restore)
+	pcall(Adopt.releaseAll)
+	if UI.gui then UI.gui:Destroy() end
+	if world then world:Destroy() end
+	_G.__MonkeyVehicleStop = nil
+end
+
+notify("Car Spawner loaded - press M for the menu")
+
+task.spawn(function()
+	local StarterGui = game:GetService("StarterGui")
+	local function toast(title, text, duration, copyText)
+		local data = { Title = title, Text = text, Duration = duration }
+		if copyText and typeof(setclipboard) == "function" then
+			local bf = Instance.new("BindableFunction")
+			bf.OnInvoke = function(btn)
+				if btn == "Copy" then pcall(setclipboard, copyText) end
+			end
+			data.Callback = bf
+			data.Button1 = "Copy"
+		end
+		for _ = 1, 20 do
+			if pcall(function() StarterGui:SetCore("SendNotification", data) end) then return end
+			task.wait(0.5)
+		end
+	end
+	toast("Car Spawner", "By DuaKNo & Monkey", 6)
+	task.wait(6.5)
+	toast("Join Discord server for more", "discord.gg/empgqd5qpq", 10, "discord.gg/empgqd5qpq")
+end)
